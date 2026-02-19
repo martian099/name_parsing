@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "name-parsing"
+version = "0.1.0"
+description = "Extract names and street info from OCR-scanned customer records using fine-tuned DistilBERT NER"
+requires-python = ">=3.10"
+dependencies = [
+    "onnxruntime>=1.16.0",
+    "transformers>=4.35.0",
+    "numpy>=1.24.0",
+]
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.1.0",
+    "datasets>=2.14.0",
+    "optimum[onnxruntime]>=1.13.0",
+    "faker>=20.0.0",
+    "seqeval>=1.2.2",
+    "accelerate>=0.24.0",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-benchmark>=4.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
