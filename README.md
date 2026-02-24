@@ -12,7 +12,7 @@ result = parser.parse("Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312")
 
 **Key features:**
 - Handles OCR noise (character swaps, drops, doubles)
-- Handles OCR-merged tokens (e.g., "37/harbor" instead of "37 Harbor")
+- Handles OCR-merged tokens (e.g., `"JohnDoe"` → `"John"` / `"Doe"`, `"37/harbor"` → `"harbor"`)
 - Extracts only the first person's name when multiple names appear
 - Returns the most distinctive street name word (filters out "Ave", "St", etc.)
 - CPU-only, ~10ms inference latency (p99)
@@ -54,7 +54,11 @@ parser.parse("John Smith, 500 Oak Ave, Denver CO 80201")
 parser.parse("Alex or Mary Doe, 1201 Braddock Ave, Richmond VA 22312")
 # {'first_name': 'alex', 'last_name': 'doe', 'street_name': 'braddock'}
 
-# OCR-merged tokens — handles gracefully
+# OCR-merged CamelCase names — splits before NER
+parser.parse("JohnDoe, 1201 Braddock Ave, Richmond VA 22312")
+# {'first_name': 'john', 'last_name': 'doe', 'street_name': 'braddock'}
+
+# OCR-merged token with special character
 parser.parse("sarah martinez 37/harbor way coastal city, ca 90210")
 # {'first_name': 'sarah', 'last_name': 'martinez', 'street_name': 'harbor'}
 
@@ -73,7 +77,13 @@ python training/generate_training_data.py \
     --output data/raw/train.json \
     --seed 42
 
-# Step 2: Fine-tune DistilBERT (takes ~6 min on CPU)
+# Step 2: Generate a held-out test set (different seed to avoid leakage)
+python training/generate_training_data.py \
+    --num-examples 1000 \
+    --output data/raw/test.json \
+    --seed 99
+
+# Step 3: Fine-tune DistilBERT (takes ~6 min on CPU)
 python training/train.py \
     --data data/raw/train.json \
     --output models/finetuned \
@@ -81,19 +91,41 @@ python training/train.py \
     --batch-size 16 \
     --lr 5e-5
 
-# Step 3: Export to ONNX + quantize (265 MB → 67 MB)
+# Step 4: Export to ONNX + quantize (265 MB → 67 MB)
 python training/export_onnx.py \
     --model models/finetuned \
     --output models/onnx
 
-# Step 4: Evaluate accuracy
+# Step 5: Evaluate accuracy on the held-out test set
 python training/evaluate.py \
     --model models/onnx/quantized \
-    --data data/raw/train.json \
+    --data data/raw/test.json \
     --max-examples 500
 ```
 
-### 4. Run Tests
+### 4. Adding Your Own Labeled Examples
+
+The training data format is intentionally simple — just raw text, preprocessed text, and word-level labels:
+
+```json
+{
+  "text": "JohnDoe, 500 Oak Ave, Denver CO",
+  "preprocessed": "John Doe 500 Oak Ave Denver CO",
+  "labels": [1, 3, 0, 5, 0, 0, 0, 0]
+}
+```
+
+Labels are integer IDs mapping to:
+```
+0=O, 1=B-FIRST_NAME, 2=I-FIRST_NAME, 3=B-LAST_NAME, 4=I-LAST_NAME,
+5=B-STREET_NAME, 6=I-STREET_NAME
+```
+
+The `preprocessed` field is the output of `preprocess_ocr_text()` applied to `text` — it splits
+CamelCase merges, digit↔letter boundaries, and removes punctuation/special characters.
+You can create manually labeled examples and mix them into `train.json` before retraining.
+
+### 5. Run Tests
 
 ```bash
 # Run all tests (unit tests + integration tests + benchmark)
@@ -113,18 +145,18 @@ name-parsing/
 ├── src/name_parsing/          # Main package (used at inference time)
 │   ├── __init__.py            # Exports NameAddressParser
 │   ├── config.py              # Labels, paths, hyperparameters
-│   ├── model.py               # NameAddressParser: tokenize → ONNX → postprocess
-│   └── postprocessor.py       # Entity extraction, gap-aware joining, street filtering
+│   ├── model.py               # NameAddressParser: preprocess → tokenize → ONNX → postprocess
+│   └── postprocessor.py       # Word-level entity extraction and street filtering
 │
 ├── training/                  # Training pipeline (run once)
 │   ├── generate_training_data.py  # Synthetic data with OCR noise
-│   ├── train.py               # Fine-tune DistilBERT
+│   ├── train.py               # Fine-tune DistilBERT (tokenizes on-the-fly)
 │   ├── export_onnx.py         # ONNX export + INT8 quantization
 │   └── evaluate.py            # Per-field accuracy evaluation
 │
 ├── tests/
-│   ├── test_postprocessor.py  # 26 unit tests for post-processing logic
-│   └── test_inference.py      # 8 integration tests + latency benchmark
+│   ├── test_postprocessor.py  # 20 unit tests for post-processing logic
+│   └── test_inference.py      # 12 integration tests + latency benchmark
 │
 ├── notebooks/
 │   ├── play.ipynb             # Interactive playground
@@ -136,8 +168,9 @@ name-parsing/
 │       ├── onnx_export/       # Full-precision ONNX model
 │       └── quantized/         # INT8 quantized model (used for inference)
 │
-├── data/raw/                  # Training data (generated)
-│   └── train.json
+├── data/raw/                  # Training/test data (generated)
+│   ├── train.json             # 4000 examples (seed 42)
+│   └── test.json              # 1000 examples (seed 99, held out)
 │
 ├── environment.yaml           # Conda environment (all versions pinned)
 ├── pyproject.toml             # Package config + dependency groups
@@ -147,18 +180,24 @@ name-parsing/
 
 ## How It Works
 
-This project uses **Named Entity Recognition (NER)** with a fine-tuned **DistilBERT** model to label each subword token in the input text as one of:
+This project uses a **preprocessing-first** pipeline:
 
-```
-O  B-FIRST_NAME  I-FIRST_NAME  B-LAST_NAME  I-LAST_NAME  B-STREET_NAME  I-STREET_NAME
-```
+1. **Preprocess** the raw OCR text to split merged tokens before the model sees them:
+   - CamelCase: `"JohnDoe"` → `"John Doe"`
+   - Digit↔letter: `"37harbor"` → `"37 harbor"`
+   - Special chars: `"37/harbor"` → `"37 harbor"`
+   - Punctuation stripped: `"Doe,"` → `"Doe"`
 
-The pipeline:
-1. **Tokenize** the raw OCR text with WordPiece (no whitespace pre-splitting)
-2. **Predict** a label for each subword token using the quantized ONNX model
-3. **Post-process**: extract entities, join subwords (gap-aware), filter street names
+2. **Tokenize** the cleaned word list with WordPiece using `is_split_into_words=True`
 
-The character-level tokenization approach is critical — it lets the model handle OCR-merged tokens (like "37/harbor") because WordPiece splits on learned subword boundaries, not whitespace. Each subword gets its own label, so the model can correctly identify "harbor" as a street name even when it's jammed against "37/".
+3. **Predict** a BIO label for each word using the quantized ONNX model:
+   ```
+   O  B-FIRST_NAME  I-FIRST_NAME  B-LAST_NAME  I-LAST_NAME  B-STREET_NAME  I-STREET_NAME
+   ```
+
+4. **Post-process**: extract entity spans from BIO predictions, filter generic street words
+
+The preprocessing step is the critical insight — by splitting OCR-merged tokens *before* the model, each word gets a clean label. The model sees `"John"` and `"Doe"` as separate words with separate predictions, not a merged `"JohnDoe"` that it would have to decode internally.
 
 For a deep dive into the architecture, design decisions, and implementation details, see [DOCUMENTATION.md](DOCUMENTATION.md).
 
@@ -177,11 +216,14 @@ No PyTorch needed at runtime. Total footprint: ~67 MB model + ~50 MB libraries.
 | Metric | Value |
 |--------|-------|
 | Training F1 | 99.75% |
-| first_name accuracy | 100% |
-| last_name accuracy | 100% |
-| street_name accuracy | 99.8% |
+| first_name accuracy | 100% (500/500) |
+| last_name accuracy | 99.0% (495/500) |
+| street_name accuracy | 97.2% (485/499) |
+| Overall accuracy | 98.7% (1480/1499) |
 | Inference latency (p99) | ~10ms |
 | Model size (quantized) | 67 MB |
+
+Remaining errors are primarily OCR corruption that garbles the entity itself (e.g., `"ond"` OCR'd from `"and"` getting predicted as a last name) or digit-in-word substitutions (`"High1and"` → `"High 1 and"` where only the first word is predicted).
 
 ## License
 

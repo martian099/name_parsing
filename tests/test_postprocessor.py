@@ -1,7 +1,8 @@
-"""Tests for the post-processing pipeline (V2: subword-based).
+"""Tests for the post-processing pipeline (V3: word-level).
 
-Tests use mock subword tokens and offset_mapping to simulate what the
-tokenizer + model would produce, without needing a real model.
+Tests pass words and word_ids directly — no tokenizer, no offset_mapping.
+word_ids mirrors what encoding.word_ids() returns: None for special tokens,
+an int index for each subtoken pointing to its source word.
 """
 
 import sys
@@ -10,240 +11,210 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from name_parsing.config import LABEL2ID
-from name_parsing.postprocessor import (
-    _join_token_infos,
-    extract_entities,
-    filter_street_name,
-    postprocess,
-)
+from name_parsing.postprocessor import extract_entities, filter_street_name, postprocess
 
 
-def _make_mock_data(text_tokens: list[str], labels: list[str]):
-    """Build mock tokens, predictions, and offset_mapping for testing.
+def _make_word_ids(words: list[str], subtokens_per_word: list[int] | None = None) -> list[int | None]:
+    """Build a word_ids list as if from encoding.word_ids().
 
-    Simulates realistic offset_mapping: non-## tokens are separated by 1-char
-    gaps (representing spaces), while ## tokens are adjacent to their predecessor
-    (no gap).
+    By default each word produces exactly one subtoken.
+    Pass subtokens_per_word to simulate multi-subtoken words,
+    e.g. subtokens_per_word=[1, 2, 1] means word 1 has 2 subtokens.
 
-    Args:
-        text_tokens: List of subword tokens (use ## prefix for continuations).
-        labels: List of BIO label strings, same length as text_tokens.
-
-    Returns:
-        (predictions, tokens, offset_mapping) with [CLS] and [SEP] added.
+    Always wraps with None for [CLS] and [SEP].
     """
-    tokens = ["[CLS]"] + text_tokens + ["[SEP]"]
-    preds = [-100] + [LABEL2ID[l] for l in labels] + [-100]
-
-    # Build offset_mapping with realistic gaps:
-    # - ## tokens are adjacent (no gap) to previous token
-    # - non-## tokens have a 1-char gap (space) from previous token
-    offset_mapping = [(0, 0)]  # [CLS]
-    pos = 0
-    for i, tok in enumerate(text_tokens):
-        if i > 0 and not tok.startswith("##"):
-            pos += 1  # space gap before non-## tokens
-        clean = tok.lstrip("#") if tok.startswith("##") else tok
-        end = pos + len(clean)
-        offset_mapping.append((pos, end))
-        pos = end
-    offset_mapping.append((0, 0))  # [SEP]
-
-    return preds, tokens, offset_mapping
+    if subtokens_per_word is None:
+        subtokens_per_word = [1] * len(words)
+    ids: list[int | None] = [None]  # [CLS]
+    for word_idx, n in enumerate(subtokens_per_word):
+        ids.extend([word_idx] * n)
+    ids.append(None)  # [SEP]
+    return ids
 
 
-def _extract_texts(entity_spans):
-    """Helper: extract just the text strings from entity spans for easier assertion."""
-    return [[text for text, _, _ in span] for span in entity_spans]
+def _make_predictions(words: list[str], labels: list[str],
+                      subtokens_per_word: list[int] | None = None) -> list[int]:
+    """Build a predictions list aligned with word_ids.
+
+    For multi-subtoken words, the first subtoken gets the real label
+    and subsequent subtokens get -100 (which maps to 0/O via ID2LABEL default).
+    Wraps with 0 for [CLS] and [SEP] special token positions.
+    """
+    if subtokens_per_word is None:
+        subtokens_per_word = [1] * len(words)
+    preds: list[int] = [0]  # [CLS] -> ignored (word_id=None)
+    for word_idx, (label, n) in enumerate(zip(labels, subtokens_per_word)):
+        preds.append(LABEL2ID[label])
+        preds.extend([0] * (n - 1))  # continuation subtokens: O
+    preds.append(0)  # [SEP]
+    return preds
 
 
 class TestExtractEntities:
     def test_single_name(self):
-        preds, tokens, offsets = _make_mock_data(
-            ["alex", "doe", "1201", "brad", "##dock", "ave"],
-            ["B-FIRST_NAME", "B-LAST_NAME", "O", "B-STREET_NAME", "I-STREET_NAME", "O"],
-        )
-        entities = extract_entities(preds, tokens, offsets)
+        words = ["Alex", "Doe", "1201", "Braddock", "Ave"]
+        labels = ["B-FIRST_NAME", "B-LAST_NAME", "O", "B-STREET_NAME", "O"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert _extract_texts(entities["FIRST_NAME"]) == [["alex"]]
-        assert _extract_texts(entities["LAST_NAME"]) == [["doe"]]
-        assert _extract_texts(entities["STREET_NAME"]) == [["brad", "dock"]]
+        entities = extract_entities(preds, words, word_ids)
+
+        assert entities["FIRST_NAME"] == [["Alex"]]
+        assert entities["LAST_NAME"] == [["Doe"]]
+        assert entities["STREET_NAME"] == [["Braddock"]]
 
     def test_shared_last_name(self):
-        preds, tokens, offsets = _make_mock_data(
-            ["alex", "or", "mary", "doe", "1201", "brad", "##dock", "ave"],
-            ["B-FIRST_NAME", "O", "O", "B-LAST_NAME", "O", "B-STREET_NAME", "I-STREET_NAME", "O"],
-        )
-        entities = extract_entities(preds, tokens, offsets)
+        words = ["Alex", "or", "Mary", "Doe", "1201", "Braddock", "Ave"]
+        labels = ["B-FIRST_NAME", "O", "O", "B-LAST_NAME", "O", "B-STREET_NAME", "O"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert _extract_texts(entities["FIRST_NAME"]) == [["alex"]]
-        assert _extract_texts(entities["LAST_NAME"]) == [["doe"]]
-        assert _extract_texts(entities["STREET_NAME"]) == [["brad", "dock"]]
+        entities = extract_entities(preds, words, word_ids)
+
+        assert entities["FIRST_NAME"] == [["Alex"]]
+        assert entities["LAST_NAME"] == [["Doe"]]
+        assert entities["STREET_NAME"] == [["Braddock"]]
 
     def test_separate_names(self):
-        preds, tokens, offsets = _make_mock_data(
-            ["alex", "doe", "or", "mary", "smith", "1201", "oak", "st"],
-            ["B-FIRST_NAME", "B-LAST_NAME", "O", "O", "O", "O", "B-STREET_NAME", "O"],
-        )
-        entities = extract_entities(preds, tokens, offsets)
+        words = ["Alex", "Doe", "or", "Mary", "Smith", "500", "Oak", "Ave"]
+        labels = ["B-FIRST_NAME", "B-LAST_NAME", "O", "O", "O", "O", "B-STREET_NAME", "O"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert _extract_texts(entities["FIRST_NAME"]) == [["alex"]]
-        assert _extract_texts(entities["LAST_NAME"]) == [["doe"]]
-        assert _extract_texts(entities["STREET_NAME"]) == [["oak"]]
+        entities = extract_entities(preds, words, word_ids)
 
-    def test_multi_subword_entity(self):
-        """Test entity spanning multiple subwords (like 'braddock' -> 'brad' + '##dock')."""
-        preds, tokens, offsets = _make_mock_data(
-            ["brad", "##dock"],
-            ["B-STREET_NAME", "I-STREET_NAME"],
-        )
-        entities = extract_entities(preds, tokens, offsets)
+        assert entities["FIRST_NAME"] == [["Alex"]]
+        assert entities["LAST_NAME"] == [["Doe"]]
+        assert entities["STREET_NAME"] == [["Oak"]]
 
-        assert _extract_texts(entities["STREET_NAME"]) == [["brad", "dock"]]
+    def test_multi_word_first_name(self):
+        words = ["Mary", "Jane", "Doe"]
+        labels = ["B-FIRST_NAME", "I-FIRST_NAME", "B-LAST_NAME"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-    def test_multi_token_first_name(self):
-        """Test two-word first name like 'Mary Jane'."""
-        preds, tokens, offsets = _make_mock_data(
-            ["mary", "jane", "doe"],
-            ["B-FIRST_NAME", "I-FIRST_NAME", "B-LAST_NAME"],
-        )
-        entities = extract_entities(preds, tokens, offsets)
+        entities = extract_entities(preds, words, word_ids)
 
-        assert _extract_texts(entities["FIRST_NAME"]) == [["mary", "jane"]]
+        assert entities["FIRST_NAME"] == [["Mary", "Jane"]]
+        assert entities["LAST_NAME"] == [["Doe"]]
+
+    def test_multi_subtoken_word_uses_first_subtoken(self):
+        """Word 'Braddock' splits into 2 subtokens; first subtoken label wins."""
+        words = ["Braddock"]
+        labels = ["B-STREET_NAME"]
+        preds = _make_predictions(words, labels, subtokens_per_word=[2])
+        word_ids = _make_word_ids(words, subtokens_per_word=[2])
+
+        entities = extract_entities(preds, words, word_ids)
+
+        assert entities["STREET_NAME"] == [["Braddock"]]
 
     def test_special_tokens_only(self):
-        tokens = ["[CLS]", "[SEP]"]
-        preds = [-100, -100]
-        offsets = [(0, 0), (0, 0)]
+        preds = [0, 0]
+        words = []
+        word_ids = [None, None]
 
-        entities = extract_entities(preds, tokens, offsets)
+        entities = extract_entities(preds, words, word_ids)
 
         assert entities["FIRST_NAME"] == []
         assert entities["LAST_NAME"] == []
         assert entities["STREET_NAME"] == []
 
+    def test_mismatched_I_tag_closes_entity(self):
+        """I-LAST_NAME after B-FIRST_NAME should close the first entity."""
+        words = ["Alex", "Doe"]
+        labels = ["B-FIRST_NAME", "I-LAST_NAME"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-class TestJoinTokenInfos:
-    def test_single_word_subwords(self):
-        """Subwords of one word (no gap) are concatenated directly."""
-        infos = [("brad", 0, 4), ("dock", 4, 8)]
-        assert _join_token_infos(infos) == "braddock"
+        entities = extract_entities(preds, words, word_ids)
 
-    def test_multi_word_with_gaps(self):
-        """Tokens with gaps (spaces) get spaces inserted."""
-        infos = [("silver", 0, 6), ("lake", 7, 11)]
-        assert _join_token_infos(infos) == "silver lake"
-
-    def test_mixed_subwords_and_words(self):
-        """Mix of ## continuations and separate words."""
-        infos = [("mary", 0, 4), ("jane", 5, 9)]
-        assert _join_token_infos(infos) == "mary jane"
-
-    def test_empty(self):
-        assert _join_token_infos([]) == ""
-
-    def test_single_token(self):
-        assert _join_token_infos([("alex", 0, 4)]) == "alex"
+        assert entities["FIRST_NAME"] == [["Alex"]]
+        assert entities["LAST_NAME"] == []
 
 
 class TestFilterStreetName:
-    def test_single_distinct(self):
-        assert filter_street_name([[("braddock", 0, 8)]]) == "braddock"
+    def test_single_distinct_word(self):
+        assert filter_street_name([["Braddock"]]) == "Braddock"
 
-    def test_joined_subwords(self):
-        # Subwords of one word (no gap) -> "braddock"
-        assert filter_street_name([[("brad", 0, 4), ("dock", 4, 8)]]) == "braddock"
+    def test_filters_generic_suffix(self):
+        assert filter_street_name([["Braddock"], ["Ave"]]) == "Braddock"
 
-    def test_multi_word_street_filters_generic(self):
-        """'silver lake' span — neither is generic so it returns 'silver'."""
-        # "silver lake" as a single span with a gap
-        assert filter_street_name([[("silver", 0, 6), ("lake", 7, 11)]]) == "silver"
+    def test_multi_word_span_returns_first_distinct(self):
+        # "Silver Lake" — neither is generic, returns first
+        assert filter_street_name([["Silver", "Lake"]]) == "Silver"
 
-    def test_filters_generic(self):
-        # Two separate spans: street name and suffix
-        assert filter_street_name([[("braddock", 0, 8)], [("ave", 10, 13)]]) == "braddock"
+    def test_all_generic_returns_first_word(self):
+        assert filter_street_name([["North"], ["Ave"]]) == "North"
 
-    def test_all_generic_returns_first(self):
-        assert filter_street_name([[("north", 0, 5)], [("ave", 6, 9)]]) == "north"
+    def test_filters_numeric(self):
+        assert filter_street_name([["1201"], ["Braddock"]]) == "Braddock"
+
+    def test_ocr_mangled_number(self):
+        # "553s7" — 4 of 5 chars are digits/digit-adjacent, treated as numeric
+        assert filter_street_name([["553s7"], ["Braddock"]]) == "Braddock"
+
+    def test_multiple_spans_returns_first_distinct(self):
+        assert filter_street_name([["Oak"], ["Maple"]]) == "Oak"
 
     def test_empty(self):
         assert filter_street_name([]) == ""
 
-    def test_multiple_spans(self):
-        assert filter_street_name([[("oak", 0, 3)], [("maple", 5, 10)]]) == "oak"
-
-    def test_filters_numeric(self):
-        assert filter_street_name([[("1201", 0, 4)], [("braddock", 5, 13)]]) == "braddock"
-
-    def test_ocr_mangled_number(self):
-        assert filter_street_name([[("553s7", 0, 5)], [("braddock", 6, 14)]]) == "braddock"
-
 
 class TestPostprocess:
     def test_full_pipeline(self):
-        preds, tokens, offsets = _make_mock_data(
-            ["alex", "or", "mary", "doe", ",", "1201", "brad", "##dock", "ave",
-             ",", "rich", "##mond", "va", "22312"],
-            ["B-FIRST_NAME", "O", "O", "B-LAST_NAME", "O", "O", "B-STREET_NAME",
-             "I-STREET_NAME", "O", "O", "O", "O", "O", "O"],
-        )
-        result = postprocess(preds, tokens, offsets)
+        words = ["Alex", "or", "Mary", "Doe", ",", "1201", "Braddock", "Ave",
+                 ",", "Richmond", "VA", "22312"]
+        labels = ["B-FIRST_NAME", "O", "O", "B-LAST_NAME", "O", "O",
+                  "B-STREET_NAME", "O", "O", "O", "O", "O"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert result["first_name"] == "alex"
-        assert result["last_name"] == "doe"
-        assert result["street_name"] == "braddock"
+        result = postprocess(preds, words, word_ids)
 
-    def test_strips_trailing_punctuation(self):
-        preds, tokens, offsets = _make_mock_data(
-            ["alex", ",", "doe", ","],
-            ["B-FIRST_NAME", "O", "B-LAST_NAME", "O"],
-        )
-        result = postprocess(preds, tokens, offsets)
-
-        assert result["first_name"] == "alex"
-        assert result["last_name"] == "doe"
+        assert result["first_name"] == "Alex"
+        assert result["last_name"] == "Doe"
+        assert result["street_name"] == "Braddock"
 
     def test_empty_input(self):
-        tokens = ["[CLS]", "[SEP]"]
-        preds = [-100, -100]
-        offsets = [(0, 0), (0, 0)]
-        result = postprocess(preds, tokens, offsets)
+        result = postprocess([0, 0], [], [None, None])
         assert result == {"first_name": "", "last_name": "", "street_name": ""}
 
-    def test_merged_ocr_token(self):
-        """Test handling of OCR-merged token like '37/harbor'."""
-        preds, tokens, offsets = _make_mock_data(
-            ["alex", "doe", "37", "/", "harbor", "way"],
-            ["B-FIRST_NAME", "B-LAST_NAME", "O", "O", "B-STREET_NAME", "O"],
-        )
-        result = postprocess(preds, tokens, offsets)
+    def test_ocr_merge_split_by_preprocessor(self):
+        """After preprocessing '37/harbor' becomes ['37', 'harbor'].
+        The model sees clean words and labels 'harbor' as STREET_NAME.
+        """
+        words = ["Alex", "Doe", "37", "harbor", "Way"]
+        labels = ["B-FIRST_NAME", "B-LAST_NAME", "O", "B-STREET_NAME", "O"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert result["first_name"] == "alex"
-        assert result["last_name"] == "doe"
+        result = postprocess(preds, words, word_ids)
+
+        assert result["first_name"] == "Alex"
+        assert result["last_name"] == "Doe"
         assert result["street_name"] == "harbor"
 
-    def test_multi_word_street_name(self):
-        """'silver lake' as B-STREET + I-STREET should produce 'silver'
-        as the first distinct word, since neither word is generic."""
-        preds, tokens, offsets = _make_mock_data(
-            ["james", "par", "##ker", "90", "silver", "lake", "dr"],
-            ["B-FIRST_NAME", "B-LAST_NAME", "I-LAST_NAME", "O",
-             "B-STREET_NAME", "I-STREET_NAME", "O"],
-        )
-        result = postprocess(preds, tokens, offsets)
+    def test_camelcase_split_name(self):
+        """After preprocessing 'JohnDoe' becomes ['John', 'Doe']."""
+        words = ["John", "Doe", "500", "Oak", "St"]
+        labels = ["B-FIRST_NAME", "B-LAST_NAME", "O", "B-STREET_NAME", "O"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert result["first_name"] == "james"
-        assert result["last_name"] == "parker"
-        # "silver lake" span -> split into ["silver", "lake"] -> both distinct -> first = "silver"
-        assert result["street_name"] == "silver"
+        result = postprocess(preds, words, word_ids)
+
+        assert result["first_name"] == "John"
+        assert result["last_name"] == "Doe"
+        assert result["street_name"] == "Oak"
 
     def test_multi_word_first_name_with_space(self):
-        """Two-word first name like 'Mary Jane' should have a space."""
-        preds, tokens, offsets = _make_mock_data(
-            ["mary", "jane", "doe"],
-            ["B-FIRST_NAME", "I-FIRST_NAME", "B-LAST_NAME"],
-        )
-        result = postprocess(preds, tokens, offsets)
+        words = ["Mary", "Jane", "Doe"]
+        labels = ["B-FIRST_NAME", "I-FIRST_NAME", "B-LAST_NAME"]
+        preds = _make_predictions(words, labels)
+        word_ids = _make_word_ids(words)
 
-        assert result["first_name"] == "mary jane"
-        assert result["last_name"] == "doe"
+        result = postprocess(preds, words, word_ids)
+
+        assert result["first_name"] == "Mary Jane"
+        assert result["last_name"] == "Doe"

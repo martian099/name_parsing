@@ -1,7 +1,8 @@
 """Fine-tune DistilBERT for token classification on OCR customer record NER.
 
-This version uses character-level tokenization (no is_split_into_words).
-Training data already contains pre-tokenized input_ids and per-subword labels.
+Training data contains raw text, preprocessed text, and word-level labels.
+This script tokenizes on-the-fly using is_split_into_words=True and expands
+word-level labels to subtoken labels (first subtoken gets the label, rest get -100).
 
 Usage:
     python training/train.py --data data/raw/train.json --output models/finetuned
@@ -36,21 +37,54 @@ from name_parsing.config import (
 )
 
 
-def load_data(data_path: str) -> DatasetDict:
-    """Load pre-tokenized JSON training data and split into train/eval."""
+def tokenize_and_align_labels(examples: dict, tokenizer) -> dict:
+    """Tokenize word lists and expand word-level labels to subtoken labels.
+
+    Each example has 'preprocessed' (space-separated words) and 'labels'
+    (one integer label ID per word). We tokenize with is_split_into_words=True
+    and assign: first subtoken of each word → word label, rest → -100.
+    """
+    word_lists = [text.split() for text in examples["preprocessed"]]
+    tokenized = tokenizer(
+        word_lists,
+        is_split_into_words=True,
+        truncation=True,
+        max_length=MAX_SEQ_LENGTH,
+        padding=False,
+    )
+
+    all_labels = []
+    for i, word_labels in enumerate(examples["labels"]):
+        word_ids = tokenized.word_ids(batch_index=i)
+        subtoken_labels = []
+        seen: set[int] = set()
+        for word_idx in word_ids:
+            if word_idx is None:
+                subtoken_labels.append(-100)
+            elif word_idx in seen:
+                subtoken_labels.append(-100)
+            else:
+                seen.add(word_idx)
+                subtoken_labels.append(word_labels[word_idx])
+        all_labels.append(subtoken_labels)
+
+    tokenized["labels"] = all_labels
+    return tokenized
+
+
+def load_data(data_path: str, tokenizer) -> DatasetDict:
+    """Load JSON training data, tokenize on-the-fly, and split into train/eval."""
     with open(data_path) as f:
         examples = json.load(f)
 
-    # Data is already tokenized with input_ids, attention_mask, labels
-    records = []
-    for ex in examples:
-        records.append({
-            "input_ids": ex["input_ids"],
-            "attention_mask": ex["attention_mask"],
-            "labels": ex["labels"],
-        })
-
+    records = [{"preprocessed": ex["preprocessed"], "labels": ex["labels"]} for ex in examples]
     dataset = Dataset.from_list(records)
+    dataset = dataset.map(
+        lambda batch: tokenize_and_align_labels(batch, tokenizer),
+        batched=True,
+        remove_columns=["preprocessed"],
+    )
+
     split = dataset.train_test_split(test_size=TRAIN_TEST_SPLIT, seed=42)
     return DatasetDict({"train": split["train"], "eval": split["test"]})
 
@@ -92,10 +126,6 @@ def main():
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     args = parser.parse_args()
 
-    print(f"Loading data from {args.data}...")
-    datasets = load_data(args.data)
-    print(f"Train: {len(datasets['train'])} examples, Eval: {len(datasets['eval'])} examples")
-
     print(f"Loading tokenizer and model: {BASE_MODEL_NAME}")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     model = AutoModelForTokenClassification.from_pretrained(
@@ -104,6 +134,10 @@ def main():
         id2label=ID2LABEL,
         label2id=LABEL2ID,
     )
+
+    print(f"Loading data from {args.data}...")
+    datasets = load_data(args.data, tokenizer)
+    print(f"Train: {len(datasets['train'])} examples, Eval: {len(datasets['eval'])} examples")
 
     data_collator = DataCollatorForTokenClassification(tokenizer=tokenizer)
 

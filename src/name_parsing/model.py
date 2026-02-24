@@ -1,12 +1,14 @@
 """Inference pipeline for OCR customer record NER extraction.
 
-V2: Tokenizes raw text directly (no is_split_into_words) and uses
-offset_mapping for subword-to-character alignment. This handles
-OCR-merged tokens like "37/harbor" correctly.
+V3: Preprocesses raw text before tokenization to split OCR-merged tokens
+(e.g. "JohnDoe" -> "John Doe", "37/harbor" -> "37 harbor"), then uses
+standard word-level NER with is_split_into_words=True and word_ids() for
+clean, unambiguous subword-to-word alignment.
 
 Loads a quantized ONNX DistilBERT model and provides a simple parse() API.
 """
 
+import re
 from pathlib import Path
 
 import numpy as np
@@ -15,6 +17,30 @@ from transformers import AutoTokenizer
 
 from name_parsing.config import MAX_SEQ_LENGTH, ONNX_MODEL_DIR
 from name_parsing.postprocessor import postprocess
+
+
+def preprocess_ocr_text(text: str) -> str:
+    """Split OCR-merged tokens into separate words before NER.
+
+    Handles:
+    - Special-char merges: "37/harbor" -> "37 harbor", "North|Gate" -> "North Gate"
+    - CamelCase merges:    "JohnDoe"   -> "John Doe",  "MaryDoe"   -> "Mary Doe"
+    - Digit<->letter:      "37harbor"  -> "37 harbor", "12Braddock" -> "12 Braddock"
+    - Punctuation:         "Doe,"      -> "Doe"  (stripped, not split into separate token)
+
+    All-lowercase merges ("johndoe") are unrecoverable without a dictionary
+    and are left as-is. OCR on printed text almost always preserves capitals.
+    """
+    # CamelCase: insert space before uppercase preceded by lowercase (do this before stripping)
+    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
+    # Digit<->letter boundary splits
+    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
+    text = re.sub(r'([A-Za-z])(\d)', r'\1 \2', text)
+    # Remove all non-alphanumeric, non-space characters (punctuation, special chars)
+    text = re.sub(r'[^A-Za-z0-9\s]', ' ', text)
+    # Collapse extra spaces
+    text = re.sub(r' +', ' ', text).strip()
+    return text
 
 
 class NameAddressParser:
@@ -64,17 +90,24 @@ class NameAddressParser:
         if not text or not text.strip():
             return {"first_name": "", "last_name": "", "street_name": ""}
 
-        # Tokenize raw text — no is_split_into_words, let WordPiece handle everything
+        # Preprocess: split OCR-merged tokens before passing to the model
+        preprocessed = preprocess_ocr_text(text)
+        words = preprocessed.split()
+
+        if not words:
+            return {"first_name": "", "last_name": "", "street_name": ""}
+
+        # Tokenize as pre-split words — clean word_ids() alignment, no offset_mapping needed
         encoding = self.tokenizer(
-            text,
+            words,
+            is_split_into_words=True,
             truncation=True,
             max_length=MAX_SEQ_LENGTH,
             padding=False,
             return_tensors="np",
-            return_offsets_mapping=True,
         )
 
-        # Run ONNX inference (offset_mapping not needed by model)
+        # Run ONNX inference
         input_feed = {
             "input_ids": encoding["input_ids"],
             "attention_mask": encoding["attention_mask"],
@@ -82,23 +115,14 @@ class NameAddressParser:
         outputs = self.session.run(None, input_feed)
         logits = outputs[0]  # shape: (1, seq_len, num_labels)
 
-        # Get predicted label IDs
+        # Get predicted label IDs and word alignment
         predictions = np.argmax(logits[0], axis=-1).tolist()
+        word_ids = encoding.word_ids()  # list[int | None], one per subtoken
 
-        # Get subword tokens and offset mapping for post-processing
-        tokens = self.tokenizer.convert_ids_to_tokens(
-            encoding["input_ids"][0].tolist()
-        )
-        offset_mapping = encoding["offset_mapping"][0].tolist()
-
-        # Convert offset_mapping to list of tuples
-        offset_mapping = [(int(s), int(e)) for s, e in offset_mapping]
-
-        # Post-process to extract entities
-        return postprocess(predictions, tokens, offset_mapping)
+        return postprocess(predictions, words, word_ids)
 
     def parse_batch(self, texts: list[str]) -> list[dict[str, str]]:
-        """Parse multiple texts. Currently processes sequentially.
+        """Parse multiple texts sequentially.
 
         Args:
             texts: List of OCR text strings.

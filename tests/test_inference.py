@@ -66,6 +66,31 @@ class TestInference:
         result = parser.parse("")
         assert result == {"first_name": "", "last_name": "", "street_name": ""}
 
+    def test_camelcase_merged_name(self, parser):
+        """'JohnDoe' split to 'John Doe' by preprocessor before inference."""
+        result = parser.parse("JohnDoe, 1201 Braddock Ave, Richmond VA 22312")
+        assert result["first_name"].lower() == "john"
+        assert result["last_name"].lower() == "doe"
+
+    def test_camelcase_name_and_special_char_street(self, parser):
+        """'MaryDoe' and '37/harbor' both handled by preprocessor."""
+        result = parser.parse("MaryDoe 37/harbor Way, Springfield IL 62704")
+        assert result["first_name"].lower() == "mary"
+        assert result["last_name"].lower() == "doe"
+        assert result["street_name"].lower() == "harbor"
+
+    def test_special_char_merged_street(self, parser):
+        """'37/harbor' split to '37 harbor' by preprocessor."""
+        result = parser.parse("Alex Doe, 37/harbor Way, Coastal City CA 90210")
+        assert result["first_name"].lower() == "alex"
+        assert result["last_name"].lower() == "doe"
+        assert result["street_name"].lower() == "harbor"
+
+    def test_digit_letter_merge(self, parser):
+        """'37harbor' (no junk char) split to '37 harbor' by preprocessor."""
+        result = parser.parse("Alex Doe, 37harbor Way, Springfield IL 62704")
+        assert result["street_name"].lower() == "harbor"
+
 
 class TestBenchmark:
     def test_latency_under_100ms(self, parser):

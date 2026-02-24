@@ -34,5 +34,5 @@ Thumbs.db
 
 # Model artifacts (large files — regenerate via training pipeline)
 # Uncomment the lines below if you don't want to track model files in git:
-# models/
+models/
 # data/raw/
