@@ -1,9 +1,11 @@
 """Inference pipeline for OCR customer record NER extraction.
 
-Labels are applied directly to raw input strings — no preprocessing step.
-The tokenizer receives whitespace-split words from the raw text, uses
-is_split_into_words=True and word_ids() for clean subword alignment.
-Post-processing strips punctuation and extracts structured fields.
+Input text is tokenized with SpaCy (blank English model) before being
+passed to DistilBERT. This matches the training-time tokenization used
+in generate_training_data.py for consistent label alignment.
+
+SpaCy separates punctuation from words (e.g. "Doe," → ["Doe", ","]), so
+entity words in the output are already clean — no punctuation stripping needed.
 
 Loads a quantized ONNX DistilBERT model and provides a simple parse() API.
 """
@@ -12,10 +14,14 @@ from pathlib import Path
 
 import numpy as np
 import onnxruntime as ort
+import spacy
 from transformers import AutoTokenizer
 
 from name_parsing.config import MAX_SEQ_LENGTH, ONNX_MODEL_DIR
 from name_parsing.postprocessor import postprocess
+
+# SpaCy blank English tokenizer (rule-based, no ML model download needed)
+_nlp = spacy.blank("en")
 
 
 class NameAddressParser:
@@ -55,8 +61,10 @@ class NameAddressParser:
     def parse(self, text: str) -> dict[str, str]:
         """Parse text and extract structured data.
 
-        Words are derived by splitting on whitespace — no preprocessing.
-        Post-processing handles punctuation stripping and field extraction.
+        Text is first tokenized with SpaCy (matching training-time preprocessing),
+        then fed to DistilBERT as pre-split words via is_split_into_words=True.
+        SpaCy separates punctuation (e.g. "Doe," → ["Doe", ","]), so entity words
+        in the output are already clean.
 
         Args:
             text: Input text, e.g. "Alex or Mary Doe, 1201 Braddock Ave, Richmond VA"
@@ -67,8 +75,8 @@ class NameAddressParser:
         if not text or not text.strip():
             return {"first_name": "", "last_name": "", "street_name": ""}
 
-        # Split raw text on whitespace — labels are trained on these raw words
-        words = text.split()
+        # SpaCy tokenization (matches training-time preprocessing)
+        words = [token.text for token in _nlp(text)]
 
         if not words:
             return {"first_name": "", "last_name": "", "street_name": ""}

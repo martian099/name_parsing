@@ -16,8 +16,9 @@ result = parser.parse("Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312")
 - Handles middle names — both abbreviated ("M.") and full ("Monroe"), skipped cleanly
 - Handles numbered streets — "1234 5th Ave" → street_name="5th"
 - Handles P.O. Box addresses — street_name="Box"
-- Labels are trained directly on raw input text — no preprocessing step
-- Post-processing strips punctuation, possessives (`"GG's"` → `"GG"`), single-letter dot-prefixes (`"A.Professional"` → `"Professional"`), and filters generic street words after inference
+- **SpaCy pre-tokenization** at both training and inference time — standard BERT fine-tuning practice; punctuation is automatically separated before labeling (e.g. "Doe," → ["Doe", ","])
+- **OCR noise training** — 15% of training words have realistic OCR errors (character substitution, deletion, insertion, swaps) for robustness on scanned text
+- **Minimal post-processing** — only the first predicted span per entity category is selected; raw model predictions returned directly
 - CPU-only inference, ~10ms latency (p99)
 - 67 MB quantized ONNX model — no GPU or PyTorch at runtime
 
@@ -57,10 +58,6 @@ parser.parse("John Smith, 500 Oak Ave, Denver CO 80201")
 parser.parse("Madison M. Jackson, 500 Oak St, Denver CO 80201")
 # {'first_name': 'Madison', 'last_name': 'Jackson', 'street_name': 'Oak'}
 
-# With full middle name
-parser.parse("Madison Monroe Jackson, 500 Oak St, Denver CO 80201")
-# {'first_name': 'Madison', 'last_name': 'Jackson', 'street_name': 'Oak'}
-
 # Multiple names — extracts only the first person
 parser.parse("Alex or Mary Doe, 1201 Braddock Ave, Richmond VA 22312")
 # {'first_name': 'Alex', 'last_name': 'Doe', 'street_name': 'Braddock'}
@@ -77,18 +74,20 @@ parser.parse("John Smith, 1234 5th Ave, Denver CO 80201")
 parser.parse("Jane Doe, P.O. Box 1234, Arlington VA 22201")
 # {'first_name': 'Jane', 'last_name': 'Doe', 'street_name': 'Box'}
 
+# OCR-noisy input (model is trained to handle these)
+parser.parse("Rache1 Mend0za, 1201 Bradd0ck Ave, Richmond VA")
+# {'first_name': 'Rache1', 'last_name': 'Mend0za', 'street_name': 'Bradd0ck'}
+
 # Batch processing
 parser.parse_batch(["John Smith, 100 Main St", "Jane Doe, 200 Oak Ave"])
 ```
 
 ### 3. Training From Scratch
 
-If you want to retrain the model (e.g., with different data or parameters):
-
 ```bash
-# Step 1: Generate synthetic training data (4000 examples)
+# Step 1: Generate synthetic training data (5000 examples, SpaCy-tokenized + OCR noise)
 python training/generate_training_data.py \
-    --num-examples 4000 \
+    --num-examples 5000 \
     --output data/raw/train.json \
     --seed 42
 
@@ -96,7 +95,7 @@ python training/generate_training_data.py \
 python training/generate_training_data.py \
     --num-examples 1000 \
     --output data/raw/test.json \
-    --seed 99
+    --seed 123
 
 # Step 3: Fine-tune DistilBERT
 # Automatically uses MPS on Apple Silicon, CUDA on NVIDIA, CPU otherwise
@@ -121,37 +120,38 @@ python training/evaluate.py \
 
 ### 4. Adding Your Own Labeled Examples
 
-The training data format is simple — raw text and word-level labels aligned with `text.split()`:
+The training data format stores SpaCy-tokenized words alongside integer labels:
 
 ```json
 {
   "text": "John Doe, 500 Oak Ave, Denver CO",
-  "labels": [1, 3, 0, 5, 0, 0, 0]
+  "words": ["John", "Doe", ",", "500", "Oak", "Ave", ",", "Denver", "CO"],
+  "labels": [1, 3, 0, 0, 5, 0, 0, 0, 0]
 }
 ```
 
-Labels are integer IDs corresponding to `text.split()` words:
+The `words` list is SpaCy-tokenized (punctuation is a separate token). Labels align with `words`:
 ```
 0=O, 1=B-FIRST_NAME, 2=I-FIRST_NAME, 3=B-LAST_NAME, 4=I-LAST_NAME,
 5=B-STREET_NAME, 6=I-STREET_NAME
 ```
 
-In the example above, `text.split()` produces `["John", "Doe,", "500", "Oak", "Ave,", "Denver", "CO"]`
-and `labels[1]=3` means `"Doe,"` is the last name. Post-processing strips the comma automatically.
+In the example: `words[1]="Doe"` has `labels[1]=3` (B-LAST_NAME), `words[2]=","` has `labels[2]=0` (O).
+SpaCy already separates the comma so no punctuation stripping is needed in post-processing.
 
 You can create manually labeled examples and mix them into `train.json` before retraining.
 
 ### 5. Run Tests
 
 ```bash
-# Run all tests (unit tests + integration tests + benchmark)
-pytest tests/ -v
-
 # Just the postprocessor unit tests (no model needed)
 pytest tests/test_postprocessor.py -v
 
 # Integration tests (requires trained model in models/onnx/quantized/)
 pytest tests/test_inference.py -v
+
+# All tests
+pytest tests/ -v
 ```
 
 ## Project Structure
@@ -161,17 +161,17 @@ name-parsing/
 ├── src/name_parsing/          # Main package (used at inference time)
 │   ├── __init__.py            # Exports NameAddressParser
 │   ├── config.py              # Labels, paths, hyperparameters
-│   ├── model.py               # NameAddressParser: tokenize → ONNX → postprocess
-│   └── postprocessor.py       # Entity extraction, punctuation stripping, street filtering
+│   ├── model.py               # NameAddressParser: SpaCy → ONNX → postprocess
+│   └── postprocessor.py       # BIO entity extraction, first-span selection
 │
 ├── training/                  # Training pipeline (run once)
-│   ├── generate_training_data.py  # Synthetic data generation
+│   ├── generate_training_data.py  # Synthetic data: SpaCy-tokenized + OCR noise
 │   ├── train.py               # Fine-tune DistilBERT (MPS / CUDA / CPU)
 │   ├── export_onnx.py         # ONNX export + INT8 quantization
 │   └── evaluate.py            # Per-field accuracy evaluation
 │
 ├── tests/
-│   ├── test_postprocessor.py  # 29 unit tests for post-processing logic
+│   ├── test_postprocessor.py  # Unit tests for BIO extraction and postprocess
 │   └── test_inference.py      # Integration tests + latency benchmark
 │
 ├── notebooks/
@@ -185,8 +185,8 @@ name-parsing/
 │       └── quantized/         # INT8 quantized model (used for inference)
 │
 ├── data/raw/                  # Training/test data (generated)
-│   ├── train.json             # 4000 examples (seed 42)
-│   └── test.json              # 1000 examples (seed 99, held out)
+│   ├── train.json             # 5000 examples (seed 42)
+│   └── test.json              # 1000 examples (seed 123, held out)
 │
 ├── environment.yaml           # Conda environment (all versions pinned)
 ├── pyproject.toml             # Package config + dependency groups
@@ -196,39 +196,33 @@ name-parsing/
 
 ## How It Works
 
-The pipeline has two phases: **training** (labels on raw text, no preprocessing) and **inference** (raw split → model → post-process).
+The pipeline has two phases: **training** (SpaCy-tokenized + OCR noise → model) and **inference** (SpaCy tokenize → model → pick first span).
 
 ### Training
 
-Labels are assigned directly to whitespace-split words from raw text. No preprocessing step — what the model sees at inference is identical to what it was trained on.
+Text is SpaCy-tokenized before label assignment. SpaCy separates punctuation into distinct tokens, so labels land on clean words — no punctuation stripping needed later.
 
 ```
 "John Doe, 1234 Braddock Ave, Denver CO"
- ↓ text.split()
-["John", "Doe,", "1234", "Braddock", "Ave,", "Denver", "CO"]
-  FN      LN      O       SN          O        O         O
+ ↓ SpaCy tokenize
+["John", "Doe", ",", "1234", "Braddock", "Ave", ",", "Denver", "CO"]
+  FN      LN    O     O       SN          O     O     O          O
 ```
 
-Punctuation like `"Doe,"` and `"Ave,"` is part of the raw word. The model learns to label these words correctly, and post-processing strips the punctuation at output time.
+~15% of words also have realistic OCR noise applied (character substitutions, deletions, insertions) to make the model robust to scanned text imperfections.
 
 ### Inference
 
 ```
-1. Split on whitespace  →  raw words (no preprocessing)
-2. Tokenize             →  WordPiece subtokens via is_split_into_words=True
-3. ONNX inference       →  BIO label per word (~10ms on CPU)
-4. Post-process         →  strip punctuation, filter generic street words, return result
+1. SpaCy tokenize  →  clean word tokens (punctuation separated)
+2. BERT tokenize   →  WordPiece subtokens via is_split_into_words=True
+3. ONNX inference  →  BIO label per word (~10ms on CPU)
+4. Post-process    →  pick first span per entity category, join words
 ```
 
-**Why no preprocessing?** Preprocessing before labeling creates shifting ground truth — the labels end up on transformed text that differs from the original input. By labeling directly on raw text, training and inference are perfectly consistent.
+**Why SpaCy pre-tokenization?** It is the standard approach for BERT fine-tuning NLP tasks. Using the same tokenizer at training and inference time ensures the model always sees the same token boundaries. SpaCy's blank English model is rule-based (no ML model download needed) and consistently separates punctuation from words.
 
-**Post-processing handles:**
-- Punctuation stripping: `"Doe,"` → `"Doe"`, `"LLC,"` → `"LLC"`
-- Possessive stripping (names only): `"GG's"` → `"GG"`
-- Single-letter dot-prefix stripping (names only): `"A.Professional"` → `"Professional"`
-- Generic street word filtering: `"Ave"`, `"St"`, `"Blvd"` filtered out
-- Ordinal number preservation: `"5th"`, `"1st"` kept as valid street names
-- P.O. Box: `"Box"` returned directly as street_name
+**Post-processing** is minimal: extract BIO entity spans, select only the first span per category (first_name, last_name, street_name), join its words. No filtering or cleaning — entity words are already clean because SpaCy separated punctuation as "O" tokens.
 
 For a deep dive into the architecture, design decisions, and implementation details, see [DOCUMENTATION.md](DOCUMENTATION.md).
 
@@ -239,19 +233,20 @@ For **inference only**, the minimal dependencies are:
 - `onnxruntime` — runs the quantized model
 - `transformers` — provides the WordPiece tokenizer
 - `numpy`
+- `spacy` — pre-tokenizes input text before inference (blank English model, no download needed)
 
-No PyTorch needed at runtime. Total footprint: ~67 MB model + ~50 MB libraries.
+No PyTorch needed at runtime. Total footprint: ~67 MB model + libraries.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Training F1 (seqeval) | 100% |
+| Training F1 (seqeval) | 99.84% |
 | Inference latency (p99) | ~10ms |
 | Model size (quantized) | 67 MB |
-| Training time (M1 Pro MPS) | ~5 min |
-| Training examples | 4,000 synthetic |
-| Test examples | 1,000 synthetic (separate seed) |
+| Training time (M1 Pro MPS) | ~7 min |
+| Training examples | 5,000 synthetic (with OCR noise) |
+| Test examples | 1,000 synthetic (seed 123, held out) |
 
 ## License
 

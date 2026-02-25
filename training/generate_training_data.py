@@ -1,8 +1,14 @@
 """Generate synthetic training data for name/address NER.
 
-New approach: Labels are created directly on raw input strings — no preprocessing.
-Words are whitespace-split from raw text, with BIO labels per word.
-Post-processing handles punctuation stripping and field extraction at inference time.
+Pre-processing: SpaCy tokenizes each raw word before label assignment.
+This aligns with the standard BERT fine-tuning pipeline and with the
+inference pipeline in model.py — both use SpaCy's blank English tokenizer.
+SpaCy separates punctuation from words (e.g. "Doe," → ["Doe", ","]),
+so entity words in the training data are clean from the start.
+
+OCR noise: ~15% of words have realistic OCR character errors introduced
+(substitution, deletion, insertion, character swap, bigram confusion) to
+make the model robust to imperfect scanned text.
 
 Data variations:
   Person types:
@@ -17,8 +23,16 @@ Data variations:
     - Numbered:  "1234 5th Ave"  (ordinal street names)
     - P.O. Box:  "P.O. Box 1234"  (street_name = "Box")
 
+Output format:
+    {
+        "text":   "John Doe, 1234 Braddock Ave, Denver CO",
+        "words":  ["John", "Doe", ",", "1234", "Braddock", "Ave", ",", "Denver", "CO"],
+        "labels": [1, 3, 0, 0, 5, 0, 0, 0, 0]
+    }
+    where labels align with the SpaCy-tokenized words list.
+
 Usage:
-    python training/generate_training_data.py --num-examples 4000 --output data/raw/train.json
+    python training/generate_training_data.py --num-examples 5000 --output data/raw/train.json
 """
 
 import argparse
@@ -27,11 +41,90 @@ import random
 import string
 from pathlib import Path
 
+import spacy
 from faker import Faker
+
+# SpaCy blank English tokenizer (rule-based, no ML model download needed)
+_nlp = spacy.blank("en")
 
 fake = Faker("en_US")
 
-# --- Name lists ---
+
+# --- OCR noise ---
+
+# Common character confusions in OCR output (visually similar glyphs)
+_OCR_CHAR_MAP = {
+    'l': '1', '1': 'l', 'I': '1',
+    'O': '0', '0': 'O',
+    'S': '5', 'Z': '2', 'G': '6',
+    'B': '8', 'n': 'u', 'u': 'n',
+}
+
+# Common multi-character OCR confusions
+_OCR_BIGRAMS = [
+    ('rn', 'm'), ('m', 'rn'),
+    ('vv', 'w'), ('w', 'vv'),
+    ('cl', 'd'),
+]
+
+# Probability that any given word gets OCR noise applied
+_NOISE_PROB = 0.15
+
+
+def _add_ocr_noise(word: str) -> str:
+    """Apply one realistic OCR error to a word.
+
+    Chooses randomly from: character substitution, deletion, insertion,
+    adjacent-character swap, or bigram substitution.
+    Only applied to words with 4+ characters that contain at least one letter,
+    to avoid corrupting short structural tokens (connectors, state codes, etc.).
+    """
+    if len(word) < 4 or not any(c.isalpha() for c in word):
+        return word
+
+    noise_type = random.choices(
+        ['substitute', 'delete', 'insert', 'swap', 'bigram'],
+        weights=[0.40, 0.20, 0.15, 0.10, 0.15],
+    )[0]
+
+    if noise_type == 'substitute':
+        candidates = [i for i, c in enumerate(word) if c in _OCR_CHAR_MAP]
+        if candidates:
+            i = random.choice(candidates)
+            word = word[:i] + _OCR_CHAR_MAP[word[i]] + word[i + 1:]
+
+    elif noise_type == 'delete' and len(word) > 3:
+        # Delete an interior character (preserve first/last to keep word recognizable)
+        i = random.randint(1, len(word) - 2)
+        word = word[:i] + word[i + 1:]
+
+    elif noise_type == 'insert':
+        # Duplicate an adjacent character (smudge / ink bleed)
+        i = random.randint(1, len(word) - 1)
+        word = word[:i] + word[i - 1] + word[i:]
+
+    elif noise_type == 'swap' and len(word) >= 2:
+        # Swap two adjacent characters
+        i = random.randint(0, len(word) - 2)
+        word = word[:i] + word[i + 1] + word[i] + word[i + 2:]
+
+    elif noise_type == 'bigram':
+        for src, dst in _OCR_BIGRAMS:
+            if src in word.lower():
+                idx = word.lower().index(src)
+                word = word[:idx] + dst + word[idx + len(src):]
+                break
+
+    return word
+
+
+def _spacy_tokenize_word(word: str) -> list[str]:
+    """Tokenize a single word with SpaCy (splits off punctuation, etc.)."""
+    tokens = [token.text for token in _nlp(word)]
+    return tokens if tokens else [word]
+
+
+# --- Name / address data lists ---
 
 FIRST_NAMES = [
     "James", "Mary", "Robert", "Patricia", "John", "Jennifer", "Michael",
@@ -109,7 +202,6 @@ STATES = [
     "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY",
 ]
 
-# Business payor data
 BUSINESS_NAMES = [
     # Tech
     "TechVision", "DataFirst", "NetCom", "CyberPath", "SmartCore",
@@ -204,18 +296,25 @@ def _random_email(first: str, last: str):
 
 
 def generate_example() -> dict:
-    """Generate one training example with word-level BIO labels on raw text.
+    """Generate one training example with SpaCy-tokenized words and BIO labels.
 
-    Words are derived by splitting the final text on whitespace.
-    Labels are assigned per whitespace-split word — no preprocessing step.
-    Post-processing strips punctuation from entity words at inference time.
+    Flow:
+      1. Build (raw_word, label) pairs for each field (name, street, city/state)
+      2. Apply OCR noise to ~15% of words (simulates scanned-text imperfections)
+      3. SpaCy-tokenize each (possibly noised) word into sub-tokens:
+           - First sub-token keeps the word's BIO label
+           - Additional sub-tokens (e.g. "," split from "Doe,") get label "O"
+      4. Return {"text": original_text, "words": spacy_tokens, "labels": label_ids}
+
+    Training and inference both operate on SpaCy-tokenized input, ensuring
+    consistent label alignment between training data and inference.
 
     Output format:
         {
-            "text": "John Doe, 1234 Braddock Ave, Denver CO 80201",
-            "labels": [1, 3, 0, 5, 0, 0, 0, 0]
+            "text":   "John Doe, 1234 Braddock Ave, Denver CO 80201",
+            "words":  ["John", "Doe", ",", "1234", "Braddock", "Ave", ",", ...],
+            "labels": [1, 3, 0, 0, 5, 0, 0, ...]
         }
-    where labels align with text.split() words.
     """
     from name_parsing.config import LABEL2ID
 
@@ -311,12 +410,25 @@ def generate_example() -> dict:
         last_word = last_token.rstrip(",")
         tokens.append((_random_email(first_word, last_word), "O"))
 
-    # Build output
-    words = [w for w, _ in tokens]
-    labels = [LABEL2ID[lbl] for _, lbl in tokens]
-    text = " ".join(words)
+    # --- Apply OCR noise, then SpaCy-tokenize each word ---
+    spacy_tokens: list[tuple[str, str]] = []
+    for word, label in tokens:
+        # Optionally corrupt word with OCR noise (preserves the label)
+        if random.random() < _NOISE_PROB:
+            word = _add_ocr_noise(word)
+        # SpaCy splits punctuation off (e.g. "Doe," → ["Doe", ","])
+        sub_tokens = _spacy_tokenize_word(word)
+        # First sub-token keeps the word's label; additional sub-tokens get "O"
+        spacy_tokens.append((sub_tokens[0], label))
+        for st in sub_tokens[1:]:
+            spacy_tokens.append((st, "O"))
 
-    return {"text": text, "labels": labels}
+    words = [w for w, _ in spacy_tokens]
+    labels = [LABEL2ID[lbl] for _, lbl in spacy_tokens]
+    # Keep original (pre-noise) whitespace text for human readability
+    text = " ".join(w for w, _ in tokens)
+
+    return {"text": text, "words": words, "labels": labels}
 
 
 def main():
@@ -324,7 +436,7 @@ def main():
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
     parser = argparse.ArgumentParser(description="Generate synthetic NER training data")
-    parser.add_argument("--num-examples", type=int, default=4000)
+    parser.add_argument("--num-examples", type=int, default=5000)
     parser.add_argument("--output", type=str, default="data/raw/train.json")
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -348,13 +460,13 @@ def main():
 
     print("\n--- Sample examples ---")
     for ex_data in examples[:5]:
-        words = ex_data["text"].split()
         labeled = [
             (word, ID2LABEL.get(lab_id, "?"))
-            for word, lab_id in zip(words, ex_data["labels"])
+            for word, lab_id in zip(ex_data["words"], ex_data["labels"])
             if lab_id != 0
         ]
-        print(f"Text: {ex_data['text']}")
+        print(f"Text:     {ex_data['text']}")
+        print(f"Words:    {ex_data['words']}")
         print(f"Entities: {labeled}")
         print()
 

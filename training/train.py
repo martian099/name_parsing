@@ -39,14 +39,13 @@ from name_parsing.config import (
 
 
 def tokenize_and_align_labels(examples: dict, tokenizer) -> dict:
-    """Tokenize word lists and expand word-level labels to subtoken labels.
+    """Tokenize SpaCy-pre-tokenized word lists and expand labels to subtoken labels.
 
-    Each example has 'text' (raw, space-separated words) and 'labels'
-    (one integer label ID per word from text.split()). We tokenize with
-    is_split_into_words=True and assign: first subtoken of each word →
-    word label, rest → -100.
+    Each example has 'words' (SpaCy-tokenized list) and 'labels'
+    (one integer label ID per word). We tokenize with is_split_into_words=True
+    and assign: first subtoken of each word → word label, rest → -100.
     """
-    word_lists = [text.split() for text in examples["text"]]
+    word_lists = examples["words"]
     tokenized = tokenizer(
         word_lists,
         is_split_into_words=True,
@@ -75,16 +74,16 @@ def tokenize_and_align_labels(examples: dict, tokenizer) -> dict:
 
 
 def load_data(data_path: str, tokenizer) -> DatasetDict:
-    """Load JSON training data, tokenize on-the-fly, and split into train/eval."""
+    """Load JSON training data (SpaCy-tokenized words), tokenize on-the-fly, and split into train/eval."""
     with open(data_path) as f:
         examples = json.load(f)
 
-    records = [{"text": ex["text"], "labels": ex["labels"]} for ex in examples]
+    records = [{"words": ex["words"], "labels": ex["labels"]} for ex in examples]
     dataset = Dataset.from_list(records)
     dataset = dataset.map(
         lambda batch: tokenize_and_align_labels(batch, tokenizer),
         batched=True,
-        remove_columns=["text"],
+        remove_columns=["words"],
     )
 
     split = dataset.train_test_split(test_size=TRAIN_TEST_SPLIT, seed=42)

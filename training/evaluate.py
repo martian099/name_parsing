@@ -1,8 +1,8 @@
 """Evaluate model on held-out test data and print per-field accuracy.
 
-Uses raw text word-level data format. Labels align with text.split() words.
-Ground truth is reconstructed from the word list + word-level labels, with
-punctuation stripped from entity words to match inference-time post-processing.
+Uses SpaCy-tokenized words from the test data. Labels align with the words list.
+Ground truth is reconstructed from words + labels; no post-processing cleaning
+is applied since SpaCy-tokenized words are already clean.
 
 Expects a separate test file (generated with a different seed than training)
 to avoid data leakage.
@@ -18,20 +18,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from name_parsing.config import GENERIC_STREET_WORDS, ID2LABEL
+from name_parsing.config import ID2LABEL
 from name_parsing.model import NameAddressParser
-from name_parsing.postprocessor import _clean_word, _is_numeric
 
 
 def extract_expected_from_example(ex: dict) -> dict[str, str]:
     """Reconstruct ground-truth entity values from a training example.
 
-    Uses words from text.split() and word-level labels to find the first
-    span of each entity type. Strips punctuation from entity words to match
-    the inference-time post-processing in postprocessor.py.
+    Uses the SpaCy-tokenized words list and word-level labels to find the first
+    span of each entity type. Words are already clean (SpaCy splits punctuation
+    as separate "O" tokens).
     """
-    words = ex["text"].split()
-    labels = ex["labels"]  # one label ID per word
+    words = ex["words"]
+    labels = ex["labels"]
 
     expected = {"first_name": "", "last_name": "", "street_name": ""}
 
@@ -47,23 +46,13 @@ def extract_expected_from_example(ex: dict) -> dict[str, str]:
             lbl = ID2LABEL.get(labels[w_idx], "O")
             if lbl == f"B-{field_prefix}":
                 in_entity = True
-                entity_words = [_clean_word(word)]
+                entity_words = [word]
             elif lbl == f"I-{field_prefix}" and in_entity:
-                entity_words.append(_clean_word(word))
+                entity_words.append(word)
             elif in_entity:
                 break  # end of first span
 
-        if entity_words:
-            if field_key == "street_name":
-                # Apply same filtering as postprocessor.filter_street_name
-                distinct = [
-                    w for w in entity_words
-                    if w.lower() not in GENERIC_STREET_WORDS and not _is_numeric(w)
-                ]
-                value = distinct[0] if distinct else entity_words[0]
-            else:
-                value = " ".join(entity_words)
-            expected[field_key] = value
+        expected[field_key] = " ".join(entity_words)
 
     return expected
 
