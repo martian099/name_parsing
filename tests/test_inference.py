@@ -2,6 +2,9 @@
 
 These tests require a trained and exported ONNX model.
 Skip if model is not available.
+
+The model is trained on raw whitespace-split text (no preprocessing).
+Post-processing strips punctuation and filters generic street words.
 """
 
 import sys
@@ -43,13 +46,30 @@ class TestInference:
         assert result["first_name"].lower() == "alex"
         assert result["last_name"].lower() == "doe"
 
-    def test_with_email(self, parser):
-        result = parser.parse(
-            "Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312, business_name@gmail.com"
-        )
-        assert result["first_name"].lower() == "alex"
+    def test_business_payor_with_prefix(self, parser):
+        """Business: location prefix + business name (first) + type (last)."""
+        result = parser.parse("Fairfax SushiMax LLC, 1201 Braddock Ave, Richmond VA")
+        assert result["first_name"].lower() == "sushimax"
+        assert result["last_name"].lower() == "llc"
+
+    def test_business_payor_no_prefix(self, parser):
+        result = parser.parse("TechVision Inc, 500 Oak Ave, Denver CO 80201")
+        assert result["first_name"].lower() == "techvision"
+        assert result["last_name"].lower() == "inc"
+
+    def test_ordinal_street(self, parser):
+        """Street names like '5th Ave' — ordinal is the street_name."""
+        result = parser.parse("John Smith, 1234 5th Ave, Denver CO 80201")
+        assert result["first_name"].lower() == "john"
+        assert result["last_name"].lower() == "smith"
+        assert result["street_name"].lower() == "5th"
+
+    def test_po_box(self, parser):
+        """P.O. Box addresses — street_name should be 'Box'."""
+        result = parser.parse("Jane Doe, P.O. Box 1234, Arlington VA 22201")
+        assert result["first_name"].lower() == "jane"
         assert result["last_name"].lower() == "doe"
-        assert result["street_name"] != ""  # model may predict "braddock" or "1201"
+        assert result["street_name"].lower() == "box"
 
     def test_with_middle_initial(self, parser):
         result = parser.parse("James R. Wilson, 742 Evergreen Ter, Springfield IL 62704")
@@ -62,40 +82,22 @@ class TestInference:
         assert "last_name" in result
         assert "street_name" in result
 
+    def test_punctuation_stripped_from_output(self, parser):
+        """Last name word 'Doe,' should be returned as 'Doe' (no comma)."""
+        result = parser.parse("Alex Doe, 1201 Braddock Ave, Richmond VA")
+        assert "," not in result["first_name"]
+        assert "," not in result["last_name"]
+        assert "," not in result["street_name"]
+
     def test_empty_input(self, parser):
         result = parser.parse("")
         assert result == {"first_name": "", "last_name": "", "street_name": ""}
-
-    def test_camelcase_merged_name(self, parser):
-        """'JohnDoe' split to 'John Doe' by preprocessor before inference."""
-        result = parser.parse("JohnDoe, 1201 Braddock Ave, Richmond VA 22312")
-        assert result["first_name"].lower() == "john"
-        assert result["last_name"].lower() == "doe"
-
-    def test_camelcase_name_and_special_char_street(self, parser):
-        """'MaryDoe' and '37/harbor' both handled by preprocessor."""
-        result = parser.parse("MaryDoe 37/harbor Way, Springfield IL 62704")
-        assert result["first_name"].lower() == "mary"
-        assert result["last_name"].lower() == "doe"
-        assert result["street_name"].lower() == "harbor"
-
-    def test_special_char_merged_street(self, parser):
-        """'37/harbor' split to '37 harbor' by preprocessor."""
-        result = parser.parse("Alex Doe, 37/harbor Way, Coastal City CA 90210")
-        assert result["first_name"].lower() == "alex"
-        assert result["last_name"].lower() == "doe"
-        assert result["street_name"].lower() == "harbor"
-
-    def test_digit_letter_merge(self, parser):
-        """'37harbor' (no junk char) split to '37 harbor' by preprocessor."""
-        result = parser.parse("Alex Doe, 37harbor Way, Springfield IL 62704")
-        assert result["street_name"].lower() == "harbor"
 
 
 class TestBenchmark:
     def test_latency_under_100ms(self, parser):
         """Each inference must complete within 100ms on CPU."""
-        text = "Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312, business_name@gmail.com"
+        text = "Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312"
 
         # Warm up
         for _ in range(5):

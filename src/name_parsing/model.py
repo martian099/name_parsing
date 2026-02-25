@@ -1,14 +1,13 @@
 """Inference pipeline for OCR customer record NER extraction.
 
-V3: Preprocesses raw text before tokenization to split OCR-merged tokens
-(e.g. "JohnDoe" -> "John Doe", "37/harbor" -> "37 harbor"), then uses
-standard word-level NER with is_split_into_words=True and word_ids() for
-clean, unambiguous subword-to-word alignment.
+Labels are applied directly to raw input strings — no preprocessing step.
+The tokenizer receives whitespace-split words from the raw text, uses
+is_split_into_words=True and word_ids() for clean subword alignment.
+Post-processing strips punctuation and extracts structured fields.
 
 Loads a quantized ONNX DistilBERT model and provides a simple parse() API.
 """
 
-import re
 from pathlib import Path
 
 import numpy as np
@@ -19,32 +18,8 @@ from name_parsing.config import MAX_SEQ_LENGTH, ONNX_MODEL_DIR
 from name_parsing.postprocessor import postprocess
 
 
-def preprocess_ocr_text(text: str) -> str:
-    """Split OCR-merged tokens into separate words before NER.
-
-    Handles:
-    - Special-char merges: "37/harbor" -> "37 harbor", "North|Gate" -> "North Gate"
-    - CamelCase merges:    "JohnDoe"   -> "John Doe",  "MaryDoe"   -> "Mary Doe"
-    - Digit<->letter:      "37harbor"  -> "37 harbor", "12Braddock" -> "12 Braddock"
-    - Punctuation:         "Doe,"      -> "Doe"  (stripped, not split into separate token)
-
-    All-lowercase merges ("johndoe") are unrecoverable without a dictionary
-    and are left as-is. OCR on printed text almost always preserves capitals.
-    """
-    # CamelCase: insert space before uppercase preceded by lowercase (do this before stripping)
-    text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)
-    # Digit<->letter boundary splits
-    text = re.sub(r'(\d)([A-Za-z])', r'\1 \2', text)
-    text = re.sub(r'([A-Za-z])(\d)', r'\1 \2', text)
-    # Remove all non-alphanumeric, non-space characters (punctuation, special chars)
-    text = re.sub(r'[^A-Za-z0-9\s]', ' ', text)
-    # Collapse extra spaces
-    text = re.sub(r' +', ' ', text).strip()
-    return text
-
-
 class NameAddressParser:
-    """Extract first_name, last_name, and street_name from OCR-scanned text.
+    """Extract first_name, last_name, and street_name from text.
 
     Args:
         model_dir: Path to directory containing the quantized ONNX model
@@ -78,11 +53,13 @@ class NameAddressParser:
         self.tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
 
     def parse(self, text: str) -> dict[str, str]:
-        """Parse OCR-scanned text and extract structured data.
+        """Parse text and extract structured data.
+
+        Words are derived by splitting on whitespace — no preprocessing.
+        Post-processing handles punctuation stripping and field extraction.
 
         Args:
-            text: Raw OCR text from a scanned document, e.g.
-                  "Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312"
+            text: Input text, e.g. "Alex or Mary Doe, 1201 Braddock Ave, Richmond VA"
 
         Returns:
             Dict with keys: first_name, last_name, street_name
@@ -90,14 +67,13 @@ class NameAddressParser:
         if not text or not text.strip():
             return {"first_name": "", "last_name": "", "street_name": ""}
 
-        # Preprocess: split OCR-merged tokens before passing to the model
-        preprocessed = preprocess_ocr_text(text)
-        words = preprocessed.split()
+        # Split raw text on whitespace — labels are trained on these raw words
+        words = text.split()
 
         if not words:
             return {"first_name": "", "last_name": "", "street_name": ""}
 
-        # Tokenize as pre-split words — clean word_ids() alignment, no offset_mapping needed
+        # Tokenize as pre-split words — clean word_ids() alignment
         encoding = self.tokenizer(
             words,
             is_split_into_words=True,
@@ -125,7 +101,7 @@ class NameAddressParser:
         """Parse multiple texts sequentially.
 
         Args:
-            texts: List of OCR text strings.
+            texts: List of text strings.
 
         Returns:
             List of result dicts.

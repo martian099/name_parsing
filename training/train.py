@@ -1,6 +1,6 @@
-"""Fine-tune DistilBERT for token classification on OCR customer record NER.
+"""Fine-tune DistilBERT for token classification on name/address NER.
 
-Training data contains raw text, preprocessed text, and word-level labels.
+Training data contains raw text and word-level labels aligned with text.split().
 This script tokenizes on-the-fly using is_split_into_words=True and expands
 word-level labels to subtoken labels (first subtoken gets the label, rest get -100).
 
@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import torch
 from datasets import Dataset, DatasetDict
 from transformers import (
     AutoModelForTokenClassification,
@@ -40,11 +41,12 @@ from name_parsing.config import (
 def tokenize_and_align_labels(examples: dict, tokenizer) -> dict:
     """Tokenize word lists and expand word-level labels to subtoken labels.
 
-    Each example has 'preprocessed' (space-separated words) and 'labels'
-    (one integer label ID per word). We tokenize with is_split_into_words=True
-    and assign: first subtoken of each word → word label, rest → -100.
+    Each example has 'text' (raw, space-separated words) and 'labels'
+    (one integer label ID per word from text.split()). We tokenize with
+    is_split_into_words=True and assign: first subtoken of each word →
+    word label, rest → -100.
     """
-    word_lists = [text.split() for text in examples["preprocessed"]]
+    word_lists = [text.split() for text in examples["text"]]
     tokenized = tokenizer(
         word_lists,
         is_split_into_words=True,
@@ -77,12 +79,12 @@ def load_data(data_path: str, tokenizer) -> DatasetDict:
     with open(data_path) as f:
         examples = json.load(f)
 
-    records = [{"preprocessed": ex["preprocessed"], "labels": ex["labels"]} for ex in examples]
+    records = [{"text": ex["text"], "labels": ex["labels"]} for ex in examples]
     dataset = Dataset.from_list(records)
     dataset = dataset.map(
         lambda batch: tokenize_and_align_labels(batch, tokenizer),
         batched=True,
-        remove_columns=["preprocessed"],
+        remove_columns=["text"],
     )
 
     split = dataset.train_test_split(test_size=TRAIN_TEST_SPLIT, seed=42)
@@ -126,6 +128,14 @@ def main():
     parser.add_argument("--lr", type=float, default=LEARNING_RATE)
     args = parser.parse_args()
 
+    if torch.backends.mps.is_available():
+        device = "mps"
+    elif torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
+    print(f"Training device: {device}")
+
     print(f"Loading tokenizer and model: {BASE_MODEL_NAME}")
     tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
     model = AutoModelForTokenClassification.from_pretrained(
@@ -156,7 +166,7 @@ def main():
         greater_is_better=True,
         logging_steps=50,
         save_total_limit=2,
-        fp16=False,  # CPU training
+        fp16=False,  # MPS and CPU don't support fp16 training
         report_to="none",
     )
 

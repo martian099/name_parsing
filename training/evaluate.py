@@ -1,7 +1,8 @@
 """Evaluate model on held-out test data and print per-field accuracy.
 
-V3: Uses preprocessed word-level data format. Ground truth is reconstructed
-directly from the word list + word-level labels — no subword joining needed.
+Uses raw text word-level data format. Labels align with text.split() words.
+Ground truth is reconstructed from the word list + word-level labels, with
+punctuation stripped from entity words to match inference-time post-processing.
 
 Expects a separate test file (generated with a different seed than training)
 to avoid data leakage.
@@ -19,22 +20,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from name_parsing.config import GENERIC_STREET_WORDS, ID2LABEL
 from name_parsing.model import NameAddressParser
+from name_parsing.postprocessor import _clean_word, _is_numeric
 
 
 def extract_expected_from_example(ex: dict) -> dict[str, str]:
     """Reconstruct ground-truth entity values from a training example.
 
-    Uses the word list (from 'preprocessed') and word-level labels to find
-    the first span of each entity type, then joins the words.
+    Uses words from text.split() and word-level labels to find the first
+    span of each entity type. Strips punctuation from entity words to match
+    the inference-time post-processing in postprocessor.py.
     """
-    words = ex["preprocessed"].split()
+    words = ex["text"].split()
     labels = ex["labels"]  # one label ID per word
-
-    # Build per-word label map directly (labels are already word-level)
-    word_label: dict[int, str] = {}
-    for word_idx, lab_id in enumerate(labels):
-        if lab_id not in (0,):
-            word_label[word_idx] = ID2LABEL.get(lab_id, "O")
 
     expected = {"first_name": "", "last_name": "", "street_name": ""}
 
@@ -47,19 +44,25 @@ def extract_expected_from_example(ex: dict) -> dict[str, str]:
         in_entity = False
 
         for w_idx, word in enumerate(words):
-            lbl = word_label.get(w_idx, "O")
+            lbl = ID2LABEL.get(labels[w_idx], "O")
             if lbl == f"B-{field_prefix}":
                 in_entity = True
-                entity_words = [word]
+                entity_words = [_clean_word(word)]
             elif lbl == f"I-{field_prefix}" and in_entity:
-                entity_words.append(word)
+                entity_words.append(_clean_word(word))
             elif in_entity:
                 break  # end of first span
 
         if entity_words:
-            value = " ".join(entity_words)
-            if field_key == "street_name" and value.lower() in GENERIC_STREET_WORDS:
-                value = ""
+            if field_key == "street_name":
+                # Apply same filtering as postprocessor.filter_street_name
+                distinct = [
+                    w for w in entity_words
+                    if w.lower() not in GENERIC_STREET_WORDS and not _is_numeric(w)
+                ]
+                value = distinct[0] if distinct else entity_words[0]
+            else:
+                value = " ".join(entity_words)
             expected[field_key] = value
 
     return expected
