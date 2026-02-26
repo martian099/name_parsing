@@ -18,7 +18,7 @@ ID2LABEL = {i: label for i, label in enumerate(LABEL_LIST)}
 NUM_LABELS = len(LABEL_LIST)
 
 # Model config
-BASE_MODEL_NAME = "distilbert-base-uncased"
+BASE_MODEL_NAME = "answerdotai/ModernBERT-base"
 FINETUNED_MODEL_DIR = PROJECT_ROOT / "models" / "finetuned"
 ONNX_MODEL_DIR = PROJECT_ROOT / "models" / "onnx"
 ONNX_MODEL_PATH = ONNX_MODEL_DIR / "model_quantized.onnx"
@@ -29,8 +29,8 @@ DATA_PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
 # Training defaults
 MAX_SEQ_LENGTH = 64
-TRAIN_EPOCHS = 15
-LEARNING_RATE = 5e-5
+TRAIN_EPOCHS = 10
+LEARNING_RATE = 3e-5
 BATCH_SIZE = 16
 TRAIN_TEST_SPLIT = 0.15
 

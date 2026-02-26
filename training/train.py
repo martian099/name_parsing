@@ -1,4 +1,4 @@
-"""Fine-tune DistilBERT for token classification on name/address NER.
+"""Fine-tune ModernBERT for token classification on name/address NER.
 
 Training data contains raw text and word-level labels aligned with text.split().
 This script tokenizes on-the-fly using is_split_into_words=True and expands

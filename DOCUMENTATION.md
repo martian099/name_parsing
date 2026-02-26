@@ -69,23 +69,34 @@ O, B-FIRST_NAME, I-FIRST_NAME, B-LAST_NAME, I-LAST_NAME, B-STREET_NAME, I-STREET
 
 **Why only these three entity types?** The requirement is to extract first name, last name, and street name. Labeling only what we need keeps the model focused. Everything else (city, state, zip, email, phone) is labeled "O" — which helps the model understand structure by contrast.
 
-### What is DistilBERT?
+### What is ModernBERT?
 
-DistilBERT is a smaller, faster version of BERT — a transformer encoder model (it reads and classifies text, not generates it). Key facts:
+ModernBERT (`answerdotai/ModernBERT-base`) is a state-of-the-art encoder model released in December 2024. It is a ground-up redesign of BERT incorporating the best architectural improvements from the past five years of transformer research. Key facts:
 
-- 66M parameters, 6 layers (BERT has 110M and 12 layers)
-- Uses **WordPiece tokenization**: words are split into subwords. "Braddock" → `["brad", "##dock"]`. The `##` prefix means "continuation of the previous token"
-- We use `distilbert-base-uncased`, which lowercases all input
+- 149M parameters, 22 transformer layers
+- Uses **BPE tokenization** (byte-pair encoding via tiktoken): words are split into subwords. The tokenizer has no `##` continuation prefix — it uses standard BPE boundaries instead
+- Trained on 2 trillion tokens (vs. BERT's 16B), giving it richer language representations
+- Supports sequences up to 8,192 tokens natively (we cap at 64 for our short inputs)
+- Does **not** use `token_type_ids` — the inference pipeline only needs `input_ids` and `attention_mask`
 
-**Why DistilBERT over alternatives?**
-- **vs. BERT**: 40% fewer parameters, 60% faster, retains 97% of performance — sufficient for our narrow domain
-- **vs. RoBERTa**: Larger and slower; unnecessary capacity for short single-line inputs
-- **vs. CRF**: CRFs require hand-crafted features and don't handle text variation as well as learned embeddings
-- **vs. spaCy NER**: spaCy's built-in models target general entities (PERSON, ORG, GPE); fine-tuning for custom labels on our domain gives better control
+**Architectural improvements over DistilBERT/BERT:**
+- **Rotary Position Embeddings (RoPE)**: Better generalization to unseen sequence lengths vs. learned absolute positions
+- **Alternating Attention**: Every 3rd layer uses global attention; all other layers use local sliding-window attention — dramatically reduces compute for long sequences without sacrificing quality on short inputs
+- **GeGLU activations**: More expressive than GELU, with a learned gating mechanism
+- **Pre-layer normalization**: More stable training gradient flow compared to BERT's post-LN
+- **Flash Attention 2**: Efficient attention kernel during training (automatically converted to standard ONNX-compatible attention at export)
+
+**Why ModernBERT over DistilBERT?**
+- **Better representations**: Pre-trained on far more data with modern masking strategies (token + span masking) — produces richer contextual embeddings
+- **Same inference speed**: ModernBERT-base is competitive with DistilBERT in wall-clock inference time on CPU at our short input lengths (~64 tokens), despite having 2× the parameters
+- **Better fine-tuning efficiency**: Converges faster due to better pre-training; 10 epochs instead of 15 achieves equivalent or better accuracy
+- **Lower recommended learning rate**: 3e-5 (vs. 5e-5 for DistilBERT) due to better pre-trained weight quality
+
+**Why not ModernBERT-large?** The base model already gives excellent accuracy on this narrow domain task. The large model (395M parameters) would increase inference latency meaningfully with no practical gain.
 
 ### What is SpaCy Pre-Tokenization?
 
-Before text is fed to DistilBERT, it is first tokenized with SpaCy's blank English tokenizer — a rule-based tokenizer that properly handles punctuation separation, abbreviations, and other edge cases.
+Before text is fed to ModernBERT, it is first tokenized with SpaCy's blank English tokenizer — a rule-based tokenizer that properly handles punctuation separation, abbreviations, and other edge cases.
 
 **Why SpaCy before BERT?** This is the standard approach for BERT fine-tuning NLP tasks. SpaCy tokenization is applied identically at both training time (in `generate_training_data.py`) and inference time (in `model.py`). This guarantees that the model always sees the same token boundaries it was trained on.
 
@@ -117,10 +128,11 @@ Only words with 4+ characters that contain at least one letter are noised. This 
 
 - **ONNX** (Open Neural Network Exchange) is a format for saving models that run without PyTorch. ONNX Runtime applies graph-level optimizations (operator fusion, memory planning) not available in PyTorch's eager mode.
 - **Quantization** converts 32-bit float weights to 8-bit integers. The model becomes ~4× smaller and faster with minimal accuracy loss. We use **dynamic quantization** — weights are INT8, activations are quantized at inference time without needing a calibration dataset.
+- **Flash Attention 2** (used during training) is automatically replaced with standard scaled dot-product attention during ONNX export by `optimum`, so no special handling is required.
 
 ### What is Fine-Tuning?
 
-DistilBERT was pre-trained on general English text (Wikipedia, books) and understands English. **Fine-tuning** trains it further on our specific task — labeling customer record text — so it learns the domain patterns. Even 5,000 synthetic examples are sufficient because the base model already understands language; it just needs to learn what "first name", "last name", and "street name" mean in this context.
+ModernBERT was pre-trained on 2 trillion tokens of English text and understands language deeply. **Fine-tuning** trains it further on our specific task — labeling customer record text — so it learns the domain patterns. Even 5,000 synthetic examples are sufficient because the base model already understands language; it just needs to learn what "first name", "last name", and "street name" mean in this context. ModernBERT's richer pre-training means it needs fewer fine-tuning epochs to reach high accuracy.
 
 ---
 
@@ -181,9 +193,9 @@ Training data stores a `words` list (SpaCy-tokenized) alongside the original `te
 
 ### Decision 5: Word-Level NER with `is_split_into_words=True`
 
-SpaCy words are pre-split and passed to the BERT tokenizer with `is_split_into_words=True`. The tokenizer's `word_ids()` output gives a direct word index for each BERT subtoken, making label alignment simple:
+SpaCy words are pre-split and passed to the ModernBERT tokenizer with `is_split_into_words=True`. The tokenizer's `word_ids()` output gives a direct word index for each BPE subtoken, making label alignment simple:
 
-- **First-subtoken rule**: The prediction of the first BERT subtoken of each SpaCy word represents that word's label. Continuation subtokens (same `word_id`) are ignored.
+- **First-subtoken rule**: The prediction of the first BPE subtoken of each SpaCy word represents that word's label. Continuation subtokens (same `word_id`) are ignored.
 - **No offset arithmetic**: `word_ids()` eliminates the need for character offset mapping
 - **Simple entity reconstruction**: Entity text is just `" ".join(entity_words)` — no gap detection needed
 - **Training data portability**: Labels stored as one-integer-per-word, so data is human-readable and tokenizer-agnostic
@@ -215,7 +227,7 @@ Training uses the best available accelerator automatically:
 - **CUDA** on NVIDIA GPUs
 - **CPU** as fallback
 
-The HuggingFace Trainer + Accelerate library handles device selection. `fp16=False` is set because neither MPS nor CPU support 16-bit float training.
+The HuggingFace Trainer + Accelerate library handles device selection. `fp16=False` is set because neither MPS nor CPU support 16-bit float training reliably.
 
 Production inference uses CPU-only ONNX Runtime, which is appropriate because:
 - Inputs are tiny (typically <64 tokens) — GPU parallelism doesn't help at this scale
@@ -232,14 +244,14 @@ In a production server, concurrency is handled at the request level (multiple th
 
 ### Decision 10: MAX_SEQ_LENGTH = 64
 
-Customer records are short text — a name, an address, and sometimes an email or phone. 64 tokens covers even the longest realistic inputs. (Note: with SpaCy tokenization, punctuation is split, so the token count is slightly higher than with whitespace splitting — 64 BERT tokens still covers all typical inputs comfortably.)
+Customer records are short text — a name, an address, and sometimes an email or phone. 64 tokens covers even the longest realistic inputs. (Note: with SpaCy tokenization, punctuation is split, so the token count is slightly higher than with whitespace splitting — 64 BPE tokens still covers all typical inputs comfortably.)
 
-Transformer self-attention is O(n²) in sequence length. Padding to 128 or 512 would waste compute on padding tokens since real inputs rarely exceed ~50-60 SpaCy tokens.
+While ModernBERT natively supports sequences up to 8,192 tokens, there is no benefit to allowing longer lengths for this task. Self-attention is O(n²) in sequence length; padding to 128 or 512 would waste compute on padding tokens.
 
 ### Decision 11: Training Hyperparameters
 
-- **Learning rate 5e-5**: Standard for BERT fine-tuning. Too low → slow convergence; too high → destabilizes pre-trained weights
-- **15 epochs**: More than typical fine-tuning (3-5 epochs) because the dataset is small (5,000 examples). More passes help with generalization
+- **Learning rate 3e-5**: Slightly lower than the classic BERT fine-tuning default (5e-5) to respect ModernBERT's higher-quality pre-trained weights. Too high a learning rate risks overwriting the rich representations built during pre-training
+- **10 epochs**: Fewer than typical DistilBERT fine-tuning (15 epochs) because ModernBERT's stronger pre-training converges faster on this task
 - **Batch size 16**: Stable gradient estimates while fitting in memory on CPU/MPS
 - **Warmup ratio 0.1**: First 10% of steps use linearly increasing LR. Prevents the randomly-initialized classification head from producing large gradients that damage the pre-trained weights
 - **Weight decay 0.01**: L2 regularization to reduce overfitting on a small dataset
@@ -264,22 +276,23 @@ Transformer self-attention is O(n²) in sequence length. Padding to 128 or 512 w
          v
 2. train.py
        Reads words list directly from data (no re-tokenization)
-       Tokenizes with is_split_into_words=True → BERT WordPiece subtokens
+       Tokenizes with is_split_into_words=True → ModernBERT BPE subtokens
        Expands word labels to subtoken labels (first subtoken = label, rest = -100)
-       Fine-tunes DistilBERT on MPS / CUDA / CPU
+       Fine-tunes ModernBERT on MPS / CUDA / CPU
        85% train / 15% eval; saves best checkpoint by seqeval F1
          |
          v
 3. export_onnx.py
-       Traces PyTorch model → ONNX graph (265 MB)
-       Applies dynamic INT8 quantization → 67 MB
+       Traces PyTorch model → ONNX graph (599 MB)
+       Flash Attention 2 is replaced with standard attention by optimum at export
+       Applies dynamic INT8 quantization → 150.7 MB (74.8% reduction)
        Copies tokenizer to quantized directory (self-contained for deployment)
          |
          v
 4. evaluate.py
        Loads held-out test.json (seed 123, not seen during training)
-       Runs full inference pipeline for each example
-       Reconstructs expected values from words + labels (no cleaning needed)
+       Passes " ".join(ex["words"]) to the parser (noised input, matches training)
+       Reconstructs expected values from the same words + labels
        Reports per-field accuracy + sample errors
 ```
 
@@ -294,9 +307,9 @@ Input: "Fairfax SushiMax LLC, 1201 5th Ave, Richmond VA"
     |-- 1. SpaCy tokenize
     |      words = ["Fairfax", "SushiMax", "LLC", ",", "1201", "5th", "Ave", ",", "Richmond", "VA"]
     |
-    |-- 2. BERT tokenize with is_split_into_words=True
-    |      subtokens: [CLS] fairfax sushi ##max llc , 1201 5th ave , richmond va [SEP]
-    |      word_ids:  [None  0       1     1     2  3 4    5   6  7 8        9   None]
+    |-- 2. ModernBERT tokenize with is_split_into_words=True
+    |      subtokens: [BOS] Fairfax SushiMax LLC , 1201 5th Ave , Richmond VA [EOS]
+    |      word_ids:  [None  0       1        2  3 4    5   6  7 8        9   None]
     |
     |-- 3. ONNX inference (~10ms on CPU)
     |      logits → argmax → label IDs per subtoken
@@ -346,6 +359,8 @@ ID2LABEL = {0: "O", 1: "B-FIRST_NAME", ...}
 
 `"O"` must be index 0 because it is the default label. `-100` is the PyTorch convention for `CrossEntropyLoss` ignored positions (used for continuation subtokens and special tokens).
 
+**Model**: `BASE_MODEL_NAME = "answerdotai/ModernBERT-base"`
+
 ---
 
 ### `src/name_parsing/model.py` — Inference Pipeline
@@ -360,7 +375,7 @@ Contains the `NameAddressParser` class.
 1. Guard clause: returns empty fields for empty input
 2. `words = [token.text for token in _nlp(text)]` — SpaCy tokenization, same as training
 3. `tokenizer(words, is_split_into_words=True, return_tensors="np")` — NumPy arrays are ONNX Runtime's native format, no PyTorch dependency at inference
-4. ONNX inference: feeds `input_ids` and `attention_mask`, receives logits shape `(1, seq_len, 7)`
+4. ONNX inference: feeds `input_ids` and `attention_mask` (no `token_type_ids` — ModernBERT does not use them), receives logits shape `(1, seq_len, 7)`
 5. Argmax → predicted label IDs per subtoken
 6. `postprocess(predictions, words, word_ids)` → final dict
 
@@ -420,7 +435,7 @@ Generates `(word, label)` token lists, applies OCR noise, SpaCy-tokenizes, and s
 
 ---
 
-### `training/train.py` — Fine-Tuning DistilBERT
+### `training/train.py` — Fine-Tuning ModernBERT
 
 **Device detection**: Prints and uses MPS (Apple Silicon), CUDA (NVIDIA GPU), or CPU automatically.
 
@@ -436,11 +451,9 @@ Generates `(word, label)` token lists, applies OCR noise, SpaCy-tokenizes, and s
 
 ### `training/export_onnx.py` — ONNX Export and Quantization
 
-**Step 1 — ONNX Export**: `optimum`'s `ORTModelForTokenClassification.from_pretrained(..., export=True)` traces the PyTorch model and produces an ONNX graph.
+**Step 1 — ONNX Export**: `optimum`'s `ORTModelForTokenClassification.from_pretrained(..., export=True)` traces the PyTorch model and produces an ONNX graph. ModernBERT's Flash Attention 2 layers are automatically replaced with standard scaled dot-product attention during this tracing step, making the ONNX graph compatible with ONNX Runtime.
 
 **Step 2 — INT8 Dynamic Quantization**: `ORTQuantizer` with `AutoQuantizationConfig.avx2(is_static=False)`. The `avx2` config targets x86 CPUs with AVX2 support (most modern Intel/AMD production servers). Dynamic quantization requires no calibration dataset — activation ranges are computed at inference time.
-
-**Size reduction**: 265 MB (FP32) → 67 MB (INT8) — 75% reduction.
 
 The quantized directory is self-contained for deployment: ONNX model + tokenizer files + label map JSON.
 
@@ -450,7 +463,9 @@ The quantized directory is self-contained for deployment: ONNX model + tokenizer
 
 Measures **end-to-end accuracy** by running the full inference pipeline against held-out test data — separate seed from training, so no data leakage.
 
-**`extract_expected_from_example(ex)`**: Reconstructs expected values from training labels. Reads the `words` list directly and walks the BIO state machine to find the first span of each entity. No cleaning applied — SpaCy words are already clean; joins entity words with space to match inference output.
+**`extract_expected_from_example(ex)`**: Reconstructs expected values from training labels. Reads the `words` list directly and walks the BIO state machine to find the first span of each entity. Joins entity words with space.
+
+**Input to model**: `" ".join(ex["words"])` — the noised SpaCy tokens joined by spaces. This ensures both the expected (from `words`) and predicted (from parsing the joined words) are derived from the same noised input, giving a meaningful accuracy measurement.
 
 **Comparison**: Case-insensitive. Fields with empty expected value are skipped. Reports per-field accuracy + overall + first 10 sample errors.
 
@@ -490,14 +505,15 @@ Tests require a trained ONNX model (skipped if not present):
 
 | Metric | Value |
 |--------|-------|
-| Training F1 (seqeval) | 99.84% |
-| Training precision | 99.82% |
-| Training recall | 99.87% |
+| Training F1 (seqeval) | 99.71% |
+| Training precision | 99.73% |
+| Training recall | 99.69% |
+| End-to-end accuracy (evaluate.py) | 99.3% |
 | Inference latency (p50) | ~10ms |
 | Inference latency (p99) | ~10ms |
-| Model size (quantized) | 67 MB |
-| Model size (FP32 ONNX) | 265 MB |
-| Training time (M1 Pro MPS) | ~7 min |
+| Model size (FP32 ONNX) | 599 MB |
+| Model size (quantized) | 150.7 MB |
+| Training time (M1 Pro MPS) | ~14 min |
 | Training examples | 5,000 synthetic (with OCR noise) |
 | Test examples | 1,000 synthetic (seed 123, held out) |
 
@@ -515,6 +531,6 @@ Tests require a trained ONNX model (skipped if not present):
 
 5. **Target specific failures**: Run `evaluate.py`, examine the errors, and add training examples that directly address the failing pattern.
 
-6. **Try a larger base model**: Swap `distilbert-base-uncased` for `bert-base-uncased` in `config.py`. This roughly doubles inference time (~20ms) but may gain 1-2% accuracy. Still well under the 100ms budget.
+6. **Increase training data volume**: Generate 10,000–20,000 examples instead of 5,000. More data with more random name/city combinations generally improves generalization, especially for rare patterns.
 
-7. **Increase training data volume**: Generate 10,000–20,000 examples instead of 5,000. More data with more random name/city combinations generally improves generalization, especially for rare patterns.
+7. **Try ModernBERT-large**: Swap `answerdotai/ModernBERT-base` for `answerdotai/ModernBERT-large` in `config.py`. This roughly doubles inference time but may gain additional accuracy on ambiguous edge cases. Still well under the 100ms latency budget.

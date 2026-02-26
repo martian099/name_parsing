@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "name-parsing"
 version = "0.1.0"
-description = "Extract names and street info from OCR-scanned customer records using fine-tuned DistilBERT NER"
+description = "Extract names and street info from OCR-scanned customer records using fine-tuned ModernBERT NER"
 requires-python = ">=3.10"
 dependencies = [
     "onnxruntime>=1.16.0",

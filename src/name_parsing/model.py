@@ -1,13 +1,13 @@
 """Inference pipeline for OCR customer record NER extraction.
 
 Input text is tokenized with SpaCy (blank English model) before being
-passed to DistilBERT. This matches the training-time tokenization used
+passed to ModernBERT. This matches the training-time tokenization used
 in generate_training_data.py for consistent label alignment.
 
 SpaCy separates punctuation from words (e.g. "Doe," → ["Doe", ","]), so
 entity words in the output are already clean — no punctuation stripping needed.
 
-Loads a quantized ONNX DistilBERT model and provides a simple parse() API.
+Loads a quantized ONNX ModernBERT model and provides a simple parse() API.
 """
 
 from pathlib import Path
@@ -62,7 +62,7 @@ class NameAddressParser:
         """Parse text and extract structured data.
 
         Text is first tokenized with SpaCy (matching training-time preprocessing),
-        then fed to DistilBERT as pre-split words via is_split_into_words=True.
+        then fed to ModernBERT as pre-split words via is_split_into_words=True.
         SpaCy separates punctuation (e.g. "Doe," → ["Doe", ","]), so entity words
         in the output are already clean.
 

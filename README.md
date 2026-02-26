@@ -1,6 +1,6 @@
 # Name & Address Parser
 
-Extract structured data from customer records using a fine-tuned DistilBERT NER model.
+Extract structured data from customer records using a fine-tuned ModernBERT NER model.
 
 ```python
 from name_parsing import NameAddressParser
@@ -20,7 +20,7 @@ result = parser.parse("Alex or Mary Doe, 1201 Braddock Ave, Richmond VA, 22312")
 - **OCR noise training** — 15% of training words have realistic OCR errors (character substitution, deletion, insertion, swaps) for robustness on scanned text
 - **Minimal post-processing** — only the first predicted span per entity category is selected; raw model predictions returned directly
 - CPU-only inference, ~10ms latency (p99)
-- 67 MB quantized ONNX model — no GPU or PyTorch at runtime
+- Quantized ONNX model — no GPU or PyTorch at runtime
 
 ## Quick Start
 
@@ -97,16 +97,16 @@ python training/generate_training_data.py \
     --output data/raw/test.json \
     --seed 123
 
-# Step 3: Fine-tune DistilBERT
+# Step 3: Fine-tune ModernBERT
 # Automatically uses MPS on Apple Silicon, CUDA on NVIDIA, CPU otherwise
 python training/train.py \
     --data data/raw/train.json \
     --output models/finetuned \
-    --epochs 15 \
+    --epochs 10 \
     --batch-size 16 \
-    --lr 5e-5
+    --lr 3e-5
 
-# Step 4: Export to ONNX + quantize (265 MB → 67 MB)
+# Step 4: Export to ONNX + quantize
 python training/export_onnx.py \
     --model models/finetuned \
     --output models/onnx
@@ -166,7 +166,7 @@ name-parsing/
 │
 ├── training/                  # Training pipeline (run once)
 │   ├── generate_training_data.py  # Synthetic data: SpaCy-tokenized + OCR noise
-│   ├── train.py               # Fine-tune DistilBERT (MPS / CUDA / CPU)
+│   ├── train.py               # Fine-tune ModernBERT (MPS / CUDA / CPU)
 │   ├── export_onnx.py         # ONNX export + INT8 quantization
 │   └── evaluate.py            # Per-field accuracy evaluation
 │
@@ -215,7 +215,7 @@ Text is SpaCy-tokenized before label assignment. SpaCy separates punctuation int
 
 ```
 1. SpaCy tokenize  →  clean word tokens (punctuation separated)
-2. BERT tokenize   →  WordPiece subtokens via is_split_into_words=True
+2. BERT tokenize   →  BPE subtokens via is_split_into_words=True
 3. ONNX inference  →  BIO label per word (~10ms on CPU)
 4. Post-process    →  pick first span per entity category, join words
 ```
@@ -231,20 +231,24 @@ For a deep dive into the architecture, design decisions, and implementation deta
 For **inference only**, the minimal dependencies are:
 
 - `onnxruntime` — runs the quantized model
-- `transformers` — provides the WordPiece tokenizer
+- `transformers` — provides the tokenizer
 - `numpy`
 - `spacy` — pre-tokenizes input text before inference (blank English model, no download needed)
 
-No PyTorch needed at runtime. Total footprint: ~67 MB model + libraries.
+No PyTorch needed at runtime.
 
 ## Performance
 
 | Metric | Value |
 |--------|-------|
-| Training F1 (seqeval) | 99.84% |
+| Training F1 (seqeval) | 99.71% |
+| Training precision | 99.73% |
+| Training recall | 99.69% |
+| End-to-end accuracy (evaluate.py) | 99.3% |
 | Inference latency (p99) | ~10ms |
-| Model size (quantized) | 67 MB |
-| Training time (M1 Pro MPS) | ~7 min |
+| Model size (FP32 ONNX) | 599 MB |
+| Model size (quantized) | 150.7 MB |
+| Training time (M1 Pro MPS) | ~14 min |
 | Training examples | 5,000 synthetic (with OCR noise) |
 | Test examples | 1,000 synthetic (seed 123, held out) |
 

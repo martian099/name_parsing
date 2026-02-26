@@ -1,8 +1,9 @@
 """Evaluate model on held-out test data and print per-field accuracy.
 
 Uses SpaCy-tokenized words from the test data. Labels align with the words list.
-Ground truth is reconstructed from words + labels; no post-processing cleaning
-is applied since SpaCy-tokenized words are already clean.
+Ground truth is reconstructed from words + labels. The model receives the noised
+words joined by spaces (matching the noised training input), so both expected and
+predicted are derived from the same noised token sequence.
 
 Expects a separate test file (generated with a different seed than training)
 to avoid data leakage.
@@ -81,7 +82,7 @@ def main():
 
     for ex in test_examples:
         expected = extract_expected_from_example(ex)
-        predicted = model.parse(ex["text"])
+        predicted = model.parse(" ".join(ex["words"]))
 
         for field in ["first_name", "last_name", "street_name"]:
             if not expected[field]:
